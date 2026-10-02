@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <memory>
+#include <functional>
 #include <format>
 #include <mutex>
 #include <random>
@@ -182,7 +184,19 @@ namespace xlog
         std::uint32_t   m_Events = 0, m_Errors = 0, m_Warnings = 0;
         std::uint64_t   m_FirstSeq = 0, m_LastSeq = 0;      // the span of sequences its events live in (other operations' events may be interleaved): a view reads them without scanning the store
         std::vector<std::uint64_t> m_Problems; // unique problem ids that occurred inside it
+        std::uint64_t   m_DroppedAtBegin = 0;  // diagnostics the collector had dropped when it began: more at its end means its evidence may be incomplete
+        bool            m_bCollectorLoss = false;
     };
+
+    // Verification (design 5.2): a success is a fact; "this problem is gone" is a separate claim that needs evidence.
+    //   Unverified  nothing has checked it again.      Reproduced  it occurred again inside a successful operation (the exit code did not make it go away).
+    //   Verified    a successful operation with the same verification target re-checked what produced it (its check unit was compiled, or the coverage was complete),
+    //               with complete evidence and no collector loss, and it did not recur.
+    enum class verification : std::uint8_t { Unverified, Reproduced, Verified };
+    // Run presence: was it there the last time its target was checked? Not observed is NOT "fixed": it may simply not have been looked at.
+    enum class presence : std::uint8_t { Observed, NotObserved, Unknown };
+    inline constexpr const char* VerificationName(verification V) noexcept { constexpr const char* N[] = { "Unverified", "Reproduced", "Verified" }; return N[static_cast<int>(V)]; }
+    inline constexpr const char* PresenceName(presence P) noexcept { constexpr const char* N[] = { "Observed", "NotObserved", "Unknown" }; return N[static_cast<int>(P)]; }
 
     struct problem
     {
@@ -198,13 +212,28 @@ namespace xlog
         std::uint64_t   m_LastOperation = 0;
         std::string     m_CheckUnit;           // what produced the last occurrence (the translation unit that was compiled)
         std::string     m_OriginName;          // who produced it (the origin of its first occurrence)
+        std::string     m_Target;              // the verification target of the last operation it occurred in ("Game.dll|Debug|x64"): what a later success has to share to speak of it
+        verification    m_Verification = verification::Unverified;
+        presence        m_Presence     = presence::Observed;
+        std::uint64_t   m_VerifiedBy   = 0;    // the operation whose success verified it
+        std::uint32_t   m_Regressions  = 0;    // times it came back after being verified
+        bool            m_bRecurring   = false; // it came back after the person acknowledged it
+        std::uint64_t   m_FirstAt = 0, m_LastAt = 0;   // when (collector clock) its first and its latest occurrence were observed: the ruler marks the first, a time range selects by both
+        std::string     m_PreviousSession;     // hex id of an earlier launch in which it had been verified resolved (a regression across launches)
     };
 
     inline constexpr std::size_t problem_retained_v = 3;
 
     // What the person decided about a problem (design 5.2: triage and suppression are independent of what the producers say). Presentation only:
     // collection continues and the original severity stays.
-    struct annotation { bool m_bAcknowledged = false; bool m_bMuted = false; };
+    struct annotation { bool m_bAcknowledged = false; bool m_bMuted = false; std::string m_Label; };   // m_Label: what the problem was called, so the person's file reads and an unmatched entry can be recognised
+
+    // A file kept with an event or an operation (design 9.3): a crash dump, a screenshot, the compiler's response file, a capture. The Logs copy it into the launch's folder
+    // (xlog_store.h Attach) and say what it is about; the record itself stays small.
+    struct attachment { std::uint64_t m_Id = 0, m_Event = 0, m_Operation = 0, m_Bytes = 0; std::string m_Name, m_Path; };
+
+    // A view the person (or the team) keeps: the query, the page and the preset. Names are unique; a team view is shared through the project's files.
+    struct saved_view { std::string m_Name, m_Query; int m_Page = 0; std::uint8_t m_State = 1; bool m_bShowMuted = false, m_bTeam = false; };
 
     // The presets of the Problems list. New = first seen after the baseline; Active = not acknowledged; All = everything not muted.
     enum class problem_view : std::uint8_t { New, Active, All };
@@ -301,6 +330,16 @@ namespace xlog
     struct op_end      { std::uint64_t m_Id = 0, m_At = 0; outcome m_Outcome = outcome::Succeeded; };
     using record = std::variant<event, op_begin, op_unit, op_coverage, op_end>;
 
+    // Where committed records go to be kept (the writer of xlog_store.h): the hub knows only this. Push is called on the host thread, in commit order, with the key already assigned;
+    // an implementation copies what it needs and never blocks (a full queue drops and counts).
+    struct sink_status { std::uint64_t m_Written = 0, m_Pending = 0, m_Dropped = 0; bool m_bFailed = false; std::string m_Reason, m_Path; };
+    struct record_sink
+    {
+        virtual ~record_sink() = default;
+        virtual void        Push(const record& R) noexcept = 0;
+        virtual sink_status Status() const noexcept = 0;
+    };
+
     class hub;
 
     // An operation in progress. Destroyed without an outcome it is recorded Abandoned, never Succeeded.
@@ -343,8 +382,11 @@ namespace xlog
         std::string     m_Channel;                 // prefix; "game.*" and "game." both mean the prefix
         std::string     m_Code;
         std::vector<std::string> m_Origins;        // origin names (origin:a,b): any of them
+        std::uint64_t   m_TimeFrom = 0, m_TimeTo = ~0ull;   // time:A-B, seconds since the launch started (either end may be left out): what the ruler's range selects
         std::string     m_Producer;                // the producer's stable namespace ("vulkan.validation", "msvc.compiler"), exactly
         std::string     m_Asset;                   // what it is about: the asset's id (hex, 8+ digits) or a part of its name/path
+        bool            m_bDeps = false;           // deps:yes - and about what that asset depends on too (the producer of the dependency knowledge fills m_AssetAlso; see hub::Parse)
+        std::vector<ref> m_AssetAlso;              // the assets m_Asset depends on (never parsed: hub::Parse resolves them)
         std::uint64_t   m_Operation  = 0;
         std::vector<std::pair<std::string, bool>> m_Terms;     // every term must match (case-insensitive); true = in the body only. A quoted phrase is ONE term
         std::string     m_NotChannel;
@@ -359,6 +401,15 @@ namespace xlog
             auto It = std::search(Hay.begin(), Hay.end(), Needle.begin(), Needle.end(), [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b)); });
             return It != Hay.end();
         }
+        // Is the reference one of the assets the wanted asset depends on?
+        inline bool RefIsOneOf(const ref& R, const std::vector<ref>& Also) noexcept
+        {
+            if (!R.Valid()) return false;
+            for (const auto& A : Also)
+                if ((A.m_Id && R.m_Id == A.m_Id) || (!A.m_Path.empty() && ContainsNoCase(R.m_Path, A.m_Path) && ContainsNoCase(A.m_Path, R.m_Path))) return true;
+            return false;
+        }
+        inline bool AboutAsset(const filter& F, const ref& R) noexcept;
         // Is the reference about this (asset:Value)? A long hex value is an id, anything else a part of the name or path.
         inline bool RefMatchesAsset(const ref& R, std::string_view Value) noexcept
         {
@@ -396,7 +447,7 @@ namespace xlog
         for (auto& T : Tokens)
         {
             // a key with nothing after it ("channel:", "op:") is a mistake, not "no filter": say so instead of returning everything
-            if (!T.empty() && T.back() == ':' && (Starts(T, "channel:") || Starts(T, "-channel:") || Starts(T, "code:") || Starts(T, "origin:") || Starts(T, "op:") || Starts(T, "body:") || Starts(T, "state:") || Starts(T, "asset:") || Starts(T, "producer:")))
+            if (!T.empty() && T.back() == ':' && (Starts(T, "channel:") || Starts(T, "-channel:") || Starts(T, "code:") || Starts(T, "origin:") || Starts(T, "op:") || Starts(T, "body:") || Starts(T, "state:") || Starts(T, "asset:") || Starts(T, "producer:") || Starts(T, "time:") || Starts(T, "deps:")))
             { F.m_Error = std::format("'{}' needs a value (channel:, code:, origin:, op:, sev>=, body:)", T); return F; }
             if (Starts(T, "sev>=") || Starts(T, "sev:"))
             {
@@ -419,7 +470,18 @@ namespace xlog
                 }
             }
             else if (Starts(T, "asset:"))   F.m_Asset = T.substr(6);
+            else if (Starts(T, "deps:"))    { const std::string V = T.substr(5); F.m_bDeps = V == "yes" || V == "1" || V == "true"; }
             else if (Starts(T, "producer:")) F.m_Producer = T.substr(9);
+            else if (Starts(T, "time:"))
+            {
+                const std::string V = T.substr(5);
+                const auto Dash = V.find('-');
+                if (Dash == std::string::npos) { F.m_Error = "time:A-B takes seconds since the launch started, e.g. time:12.5-30 or time:-5"; return F; }
+                const std::string A = V.substr(0, Dash), B = V.substr(Dash + 1);
+                char* pEnd = nullptr;
+                if (!A.empty()) { F.m_TimeFrom = static_cast<std::uint64_t>(std::strtod(A.c_str(), &pEnd) * 1.0e9); if (*pEnd) { F.m_Error = std::format("time:{} is not a number of seconds", A); return F; } }
+                if (!B.empty()) { F.m_TimeTo = static_cast<std::uint64_t>(std::strtod(B.c_str(), &pEnd) * 1.0e9); if (*pEnd) { F.m_Error = std::format("time:{} is not a number of seconds", B); return F; } }
+            }
             else if (Starts(T, "op:"))
             {
                 const auto Text = T.substr(3);
@@ -445,11 +507,15 @@ namespace xlog
         if (!F.m_Code.empty())       Add("code:" + F.m_Code);
         if (!F.m_Origins.empty())    { std::string List; for (const auto& O : F.m_Origins) List += (List.empty() ? "" : ",") + O; Add("origin:" + List); }
         if (!F.m_Asset.empty())      Add("asset:" + F.m_Asset);
+        if (F.m_bDeps)               Add("deps:yes");
         if (!F.m_Producer.empty())   Add("producer:" + F.m_Producer);
+        if (F.m_TimeFrom != 0 || F.m_TimeTo != ~0ull) Add(std::format("time:{}-{}", F.m_TimeFrom ? std::format("{:.3f}", static_cast<double>(F.m_TimeFrom) / 1.0e9) : std::string(), F.m_TimeTo != ~0ull ? std::format("{:.3f}", static_cast<double>(F.m_TimeTo) / 1.0e9) : std::string()));
         if (F.m_Operation)           Add(std::format("op:{}", F.m_Operation));
         for (const auto& [Text, bBody] : F.m_Terms) Add((bBody ? "body:\"" : "\"") + Text + "\"");
         return Out;
     }
+
+    namespace details { inline bool AboutAsset(const filter& F, const ref& R) noexcept { return RefMatchesAsset(R, F.m_Asset) || (F.m_bDeps && RefIsOneOf(R, F.m_AssetAlso)); } }
 
     inline bool Matches(const filter& F, const event& E) noexcept
     {
@@ -459,7 +525,8 @@ namespace xlog
         if (!F.m_Code.empty() && E.m_Code != F.m_Code) return false;
         if (!F.m_Origins.empty() && std::find(F.m_Origins.begin(), F.m_Origins.end(), E.m_Origin.m_Name) == F.m_Origins.end()) return false;
         if (!F.m_Producer.empty() && E.m_Producer != F.m_Producer) return false;
-        if (!F.m_Asset.empty() && !std::any_of(E.m_Subjects.begin(), E.m_Subjects.end(), [&](const ref& R) { return details::RefMatchesAsset(R, F.m_Asset); })) return false;
+        if (E.m_ObservedAt < F.m_TimeFrom || E.m_ObservedAt > F.m_TimeTo) return false;
+        if (!F.m_Asset.empty() && !std::any_of(E.m_Subjects.begin(), E.m_Subjects.end(), [&](const ref& R) { return details::AboutAsset(F, R); })) return false;
         if (F.m_Operation && E.m_Operation != F.m_Operation) return false;
         for (const auto& [Text, bBodyOnly] : F.m_Terms)
         {
@@ -502,11 +569,63 @@ namespace xlog
         static hub* current() noexcept { return s_pCurrent; }
         void make_current() noexcept    { s_pCurrent = this; }
         void release_current() noexcept { if (s_pCurrent == this) s_pCurrent = nullptr; }
-        ~hub() { release_current(); }
+        ~hub() { release_current(); m_pSink.reset(); }          // the sink first: its writer finishes while the rest of the hub is still alive
 
         // ---- any thread -------------------------------------------------------------------------------------------
+        // ---- the capture policy ---------------------------------------------------------------------------------------------------------
+        // What is collected at all, by channel and level (design 4: "a disabled call is one load and one compare"). By default everything from Debug up; Trace is
+        // not collected. A rule raises the level of a channel prefix for a while (Focus). What the policy leaves out is INTENTIONAL exclusion, counted separately from loss
+        // (a ring that overflowed): it never makes a session look partial. Callable from any thread.
+        struct capture_rule { std::string m_Prefix; severity m_Min = severity::Debug; std::uint64_t m_UntilNs = 0; };      // m_UntilNs 0 = until removed
+
+        // Is an event of this channel and level collected? Producers ask BEFORE formatting anything.
+        bool Enabled(std::string_view Channel, severity S) const noexcept
+        {
+            std::lock_guard Lock(m_PolicyMutex);
+            const std::uint64_t Now_ = Now();
+            severity Min = m_DefaultMin;
+            std::size_t Best = 0; bool bFound = false;
+            for (const auto& R : m_Rules)
+            {
+                if (R.m_UntilNs && Now_ >= R.m_UntilNs) continue;
+                if (Channel.compare(0, R.m_Prefix.size(), R.m_Prefix) != 0) continue;
+                if (!bFound || R.m_Prefix.size() >= Best) { Min = R.m_Min; Best = R.m_Prefix.size(); bFound = true; }       // the most specific rule wins
+            }
+            return S >= Min;
+        }
+
+        void SetCapture(std::string Prefix, severity Min, std::uint64_t ForNs = 0) noexcept
+        {
+            std::lock_guard Lock(m_PolicyMutex);
+            const std::uint64_t Until = ForNs ? Now() + ForNs : 0;
+            for (auto& R : m_Rules) if (R.m_Prefix == Prefix) { R.m_Min = Min; R.m_UntilNs = Until; return; }
+            m_Rules.push_back({ std::move(Prefix), Min, Until });
+        }
+        // The rule of a prefix as it is now (to put it back later); false when there is none
+        bool GetCapture(const std::string& Prefix, capture_rule& Out) const noexcept
+        {
+            std::lock_guard Lock(m_PolicyMutex);
+            for (const auto& R : m_Rules) if (R.m_Prefix == Prefix && !(R.m_UntilNs && Now() >= R.m_UntilNs)) { Out = R; return true; }
+            return false;
+        }
+        void ClearCapture(const std::string& Prefix) noexcept
+        {
+            std::lock_guard Lock(m_PolicyMutex);
+            m_Rules.erase(std::remove_if(m_Rules.begin(), m_Rules.end(), [&](const capture_rule& R) { return R.m_Prefix == Prefix; }), m_Rules.end());
+        }
+        std::vector<capture_rule> CaptureRules() const noexcept
+        {
+            std::lock_guard Lock(m_PolicyMutex);
+            std::vector<capture_rule> Out;
+            for (const auto& R : m_Rules) if (!(R.m_UntilNs && Now() >= R.m_UntilNs)) Out.push_back(R);
+            return Out;
+        }
+        severity DefaultCapture() const noexcept { return m_DefaultMin; }
+        std::uint64_t ExcludedCount(severity S) const noexcept { return m_Excluded[static_cast<int>(S)].load(std::memory_order_relaxed); }
+
         void Emit(event&& E) noexcept
         {
+            if (!Enabled(E.m_Channel, E.m_Severity)) { m_Excluded[static_cast<int>(E.m_Severity)].fetch_add(1, std::memory_order_relaxed); return; }
             E.m_ObservedAt = Now();
             const severity S = E.m_Severity;                 // read before the event is moved
             Push(record{ std::move(E) }, S);
@@ -539,6 +658,15 @@ namespace xlog
                 for (std::size_t i = 0; i < N; ++i) { Batch.push_back(std::move(m_Ring.front())); m_Ring.pop_front(); }
             }
             for (auto& R : Batch) Commit(std::move(R));
+            if (m_pSink && !m_bPersistenceFailureReported)
+                if (const sink_status St = m_pSink->Status(); St.m_bFailed)
+                {
+                    m_bPersistenceFailureReported = true;
+                    event E;
+                    E.m_Producer = "xlog.store"; E.m_Origin = { origin::type::System, "logs", 0 }; E.m_Severity = severity::Fatal; E.m_Kind = kind::Diagnostic; E.m_Channel = "logs.health";
+                    E.m_Code = "LOGS.PERSISTENCE_FAILED"; SetMessage(E, "The Logs cannot be written to disk: " + St.m_Reason + "\nThis launch's history is kept in memory only.");
+                    Emit(std::move(E));
+                }
             std::lock_guard Lock(m_RingMutex);
             return m_Ring.size();
         }
@@ -579,16 +707,117 @@ namespace xlog
         const operation* FindOperation(std::uint64_t Id) const noexcept { auto It = m_Operations.find(Id); return It == m_Operations.end() ? nullptr : &It->second; }
         const problem*   FindProblem(std::uint64_t Id) const noexcept   { auto It = m_Problems.find(Id);   return It == m_Problems.end() ? nullptr : &It->second; }
         const std::vector<std::uint64_t>& OperationOrder() const noexcept { return m_OperationOrder; }   // ascending id
+
+        // The ruler's data (design 4.1): per second of the launch, how many events and the worst severity among them. Built as events are committed, so drawing is independent of how many there are.
+        struct density_bucket { std::uint32_t m_Count = 0; severity m_Worst = severity::Trace; };
+        const std::vector<density_bucket>& Density() const noexcept { return m_Density; }
         const std::vector<origin>&        Origins() const noexcept        { return m_Origins; }              // every origin that has produced an event, once each (the Source lens lists them)
         const std::vector<std::uint64_t>& ProblemOrder() const noexcept   { return m_ProblemOrder; }     // first seen first
+
+        // ---- attachments (host thread)
+        const std::vector<attachment>& Attachments() const noexcept { return m_Attachments; }
+        std::uint64_t AddAttachment(attachment A) noexcept { A.m_Id = m_Attachments.size() + 1; const auto Id = A.m_Id; m_Attachments.push_back(std::move(A)); ++m_Revision; return Id; }
+        std::uint64_t AttachmentBytes() const noexcept { std::uint64_t N = 0; for (const auto& A : m_Attachments) N += A.m_Bytes; return N; }
+
+        // The sink, so a second one can be put beside it (a runtime that also speaks to the editor), and a one-line account of the remote runtimes for LogStatus (the host sets it).
+        std::shared_ptr<record_sink> Sink() const noexcept { return m_pSink; }
+        void SetRemoteStatus(std::function<std::string()> Fn) noexcept { m_RemoteStatus = std::move(Fn); }
+        std::string RemoteStatus() const noexcept { return m_RemoteStatus ? m_RemoteStatus() : std::string(); }
+
+        // ---- what an asset depends on (the About lens, "and what it depends on"). The editor registers a provider that knows its libraries; the Logs hold no dependency graph of their own.
+        using dependency_provider = std::function<std::vector<ref>(std::string_view Asset)>;
+        void SetDependencyProvider(dependency_provider Fn) noexcept { m_DependencyProvider = std::move(Fn); m_DepCache.clear(); }
+        void SimulateDependencies(std::string Asset, std::vector<ref> Depends) noexcept { m_SimulatedDeps[std::move(Asset)] = std::move(Depends); m_DepCache.clear(); }   // a test's stand-in for the provider
+        std::vector<ref> Dependencies(std::string_view Asset) const noexcept
+        {
+            const std::string Key(Asset);
+            if (const auto S = m_SimulatedDeps.find(Key); S != m_SimulatedDeps.end()) return S->second;
+            if (!m_DependencyProvider) return {};
+            const std::uint64_t Time = Now();
+            if (const auto C = m_DepCache.find(Key); C != m_DepCache.end() && Time - C->second.first < 2000000000ull) return C->second.second;      // a frame asks again and again: the answer is good for two seconds
+            auto Found = m_DependencyProvider(Asset);
+            m_DepCache[Key] = { Time, Found };
+            return Found;
+        }
+        // ParseQuery plus what only the hub knows: with deps:yes the assets the wanted one depends on.
+        filter Parse(std::string_view Query) const noexcept
+        {
+            filter F = ParseQuery(Query);
+            if (F.m_Error.empty() && F.m_bDeps && !F.m_Asset.empty()) F.m_AssetAlso = Dependencies(F.m_Asset);
+            return F;
+        }
+
+        // ---- persistence and earlier launches (xlog_store.h) -------------------------------------------------------------------------
+        void AttachSink(std::shared_ptr<record_sink> pSink) noexcept { m_pSink = std::move(pSink); }
+        sink_status SinkStatus() const noexcept { return m_pSink ? m_pSink->Status() : sink_status{}; }
+        bool HasSink() const noexcept { return m_pSink != nullptr; }
+
+        // Where this launch's records are written ("" = nowhere), and how the import of the earlier launches stands ("" = none was started, "running", "done n")
+        void SetPersistenceInfo(std::string Directory) noexcept { std::lock_guard Lock(m_InfoMutex); m_PersistDir = std::move(Directory); }
+        std::string PersistenceDirectory() const noexcept { std::lock_guard Lock(m_InfoMutex); return m_PersistDir; }
+        void SetImportState(std::string State) noexcept { std::lock_guard Lock(m_InfoMutex); m_ImportState = std::move(State); }
+        std::string ImportState() const noexcept { std::lock_guard Lock(m_InfoMutex); return m_ImportState; }
+
+        // A hub that holds an EARLIER launch read back from its stream (LogCompare, the history): its own session id, and records replayed as they were committed then,
+        // keys and times included. Never used on the live hub.
+        void SetSession(std::uint64_t Session) noexcept { m_Session = Session; }
+        void ReplayRecord(record&& R) noexcept
+        {
+            if (auto* pE = std::get_if<event>(&R)) { m_NextSequence = std::max<std::uint64_t>(pE->m_Key.m_Sequence, 1); CommitEvent(std::move(*pE)); }
+            else Commit(std::move(R));
+        }
+        // An operation that was still running when the launch ended did not succeed and did not fail: it was abandoned (design 4, crash recovery)
+        std::size_t AbandonRunningOperations() noexcept
+        {
+            std::size_t N = 0;
+            for (auto& [Id, O] : m_Operations) if (O.m_Outcome == outcome::Running) { O.m_Outcome = outcome::Abandoned; ++N; }
+            return N;
+        }
+
+        // Problems that were verified resolved in an earlier launch (identity -> that launch's id): when one of them appears again it is a regression across launches
+        void SetPriorVerified(std::unordered_map<std::uint64_t, std::string> Map) noexcept { std::lock_guard Lock(m_InfoMutex); m_PriorVerified = std::move(Map); }
+
+        // ---- rechecks: how a producer can be asked to look again (LogVerify) ---------------------------------------------------------------
+        // A producer that can re-run what made a problem registers, for its channel prefix, a function that STARTS that recheck as a normal operation (a build, a compile) and
+        // returns "" when it did, or why it cannot. The evidence that operation produces sets the verification state by itself: nothing here claims a result.
+        using recheck_fn = std::function<std::string(const problem&)>;
+        void SetRecheck(std::string ChannelPrefix, recheck_fn Fn) noexcept
+        {
+            for (auto& R : m_Rechecks) if (R.first == ChannelPrefix) { R.second = std::move(Fn); return; }          // one per prefix: every Level session registers the same one
+            m_Rechecks.emplace_back(std::move(ChannelPrefix), std::move(Fn));
+        }
+        std::string Recheck(const problem& P) const noexcept
+        {
+            for (const auto& [Prefix, Fn] : m_Rechecks)
+                if (P.m_Channel.compare(0, Prefix.size(), Prefix) == 0) return Fn ? Fn(P) : std::string("the producer's recheck is not available");
+            return std::format("nothing can recheck the channel '{}' (its producer registered no recheck)", P.m_Channel);
+        }
 
         // Bumped by everything a view could show: a committed record, an annotation, a new baseline. A view caches by it.
         std::uint64_t Revision() const noexcept { return m_Revision; }
 
         // ---- the person's decisions (host thread) ------------------------------------------------------------------
         annotation Annotation(std::uint64_t ProblemId) const noexcept { auto It = m_Annotations.find(ProblemId); return It == m_Annotations.end() ? annotation{} : It->second; }
-        void SetAcknowledged(std::uint64_t ProblemId, bool b) noexcept { Annotate(ProblemId).m_bAcknowledged = b; ++m_Revision; }
-        void SetMuted(std::uint64_t ProblemId, bool b) noexcept        { Annotate(ProblemId).m_bMuted = b; ++m_Revision; }
+        void SetAcknowledged(std::uint64_t ProblemId, bool b) noexcept { Annotate(ProblemId).m_bAcknowledged = b; ++m_Revision; UserChanged(); }
+        void SetMuted(std::uint64_t ProblemId, bool b) noexcept        { Annotate(ProblemId).m_bMuted = b; ++m_Revision; UserChanged(); }
+
+        // What the person decided lives past the launch (Project.config/Logs/<user>.logs.txt): the store loads it before the first event and saves on every change. An annotation whose problem
+        // has not appeared in this launch is kept as it is: it applies the moment the problem does.
+        const std::unordered_map<std::uint64_t, annotation>& Annotations() const noexcept { return m_Annotations; }
+        const std::vector<saved_view>& SavedViews() const noexcept { return m_SavedViews; }
+        void LoadUser(std::unordered_map<std::uint64_t, annotation> Annotations, std::vector<saved_view> Views) noexcept { m_Annotations = std::move(Annotations); m_SavedViews = std::move(Views); ++m_Revision; }
+        void SetOnUserChange(std::function<void()> Fn) noexcept { m_OnUserChange = std::move(Fn); }
+        const saved_view* FindView(std::string_view Name) const noexcept { for (const auto& V : m_SavedViews) if (V.m_Name == Name) return &V; return nullptr; }
+        void SaveView(saved_view View) noexcept
+        {
+            for (auto& V : m_SavedViews) if (V.m_Name == View.m_Name) { V = std::move(View); UserChanged(); return; }
+            m_SavedViews.push_back(std::move(View)); UserChanged();
+        }
+        bool DeleteView(std::string_view Name) noexcept
+        {
+            for (auto It = m_SavedViews.begin(); It != m_SavedViews.end(); ++It) if (It->m_Name == Name) { m_SavedViews.erase(It); UserChanged(); return true; }
+            return false;
+        }
         std::size_t MutedCount() const noexcept { std::size_t N = 0; for (const auto& [Id, A] : m_Annotations) if (A.m_bMuted && m_Problems.contains(Id)) ++N; return N; }
 
         // "New" means first seen after the baseline; by default that is the start of this launch (everything). Moving it is "I have seen these".
@@ -635,11 +864,18 @@ namespace xlog
             m_Ring.push_back(std::move(R));
         }
 
-        annotation& Annotate(std::uint64_t ProblemId) noexcept { return m_Annotations[ProblemId]; }
+        annotation& Annotate(std::uint64_t ProblemId) noexcept
+        {
+            auto& A = m_Annotations[ProblemId];
+            if (const problem* P = FindProblem(ProblemId)) A.m_Label = P->m_Code.empty() ? P->m_Title : P->m_Code + "  " + P->m_Title;
+            return A;
+        }
+        void UserChanged() noexcept { if (m_OnUserChange) m_OnUserChange(); }
 
         void Commit(record&& R) noexcept
         {
             ++m_Revision;
+            if (m_pSink && !std::holds_alternative<event>(R)) m_pSink->Push(R);          // operation records as they are; events are handed over in CommitEvent, once they have their key
             if (auto* pE = std::get_if<event>(&R))            CommitEvent(std::move(*pE));
             else if (auto* pB = std::get_if<op_begin>(&R))    CommitBegin(std::move(*pB));
             else if (auto* pU = std::get_if<op_unit>(&R))     { if (auto It = m_Operations.find(pU->m_Id); It != m_Operations.end() && It->second.m_Units.size() < 4096) It->second.m_Units.push_back(std::move(pU->m_Unit)); }
@@ -652,6 +888,7 @@ namespace xlog
             operation O;
             O.m_Id = B.m_Id; O.m_Parent = B.m_Parent; O.m_Kind = std::move(B.m_Kind); O.m_Title = std::move(B.m_Title);
             O.m_Origin = std::move(B.m_Origin); O.m_Subject = std::move(B.m_Subject); O.m_Started = B.m_At; O.m_VerificationTarget = std::move(B.m_Target);
+            O.m_DroppedAtBegin = DroppedImportant();
             m_OperationOrder.push_back(O.m_Id);
             m_Operations.emplace(O.m_Id, std::move(O));
             while (m_OperationOrder.size() > m_MaxOperations) { m_Operations.erase(m_OperationOrder.front()); m_OperationOrder.erase(m_OperationOrder.begin()); }
@@ -674,6 +911,41 @@ namespace xlog
                 CommitEvent(std::move(E));
             }
             O.m_bEvidenceReady = true;      // everything pushed before the end record is committed: the ring is ordered
+            O.m_bCollectorLoss = DroppedImportant() != O.m_DroppedAtBegin;
+            JudgeProblems(O);
+        }
+
+        // Warnings and above the collector had to drop (the ring overflowed): evidence that may be missing.
+        std::uint64_t DroppedImportant() const noexcept
+        {
+            std::uint64_t N = 0;
+            for (int i = static_cast<int>(severity::Warning); i < 6; ++i) N += m_Dropped[i].load(std::memory_order_relaxed);
+            return N;
+        }
+
+        // What a finished operation says about the problems of its verification target (design 5.2). Only within the coverage its producer declared:
+        // unknown coverage, a failed operation, incomplete evidence or collector loss verify nothing.
+        void JudgeProblems(const operation& O) noexcept
+        {
+            if (O.m_VerificationTarget.empty()) return;
+            for (auto& [Id, P] : m_Problems)
+            {
+                if (P.m_Target != O.m_VerificationTarget) continue;
+                const bool bOccurred = std::find(O.m_Problems.begin(), O.m_Problems.end(), Id) != O.m_Problems.end();
+                if (bOccurred)
+                {
+                    P.m_Presence = presence::Observed;
+                    if (O.m_Outcome == outcome::Succeeded && P.m_FirstSeq < O.m_FirstSeq) P.m_Verification = verification::Reproduced;       // it was here before, and the success did not remove it
+                    continue;
+                }
+                bool bChecked = false;                                    // did this operation look at what produced the problem?
+                if (O.m_Coverage == coverage_kind::Complete) bChecked = true;
+                else if (O.m_Coverage == coverage_kind::Subjects) bChecked = !P.m_CheckUnit.empty() && std::find(O.m_Units.begin(), O.m_Units.end(), P.m_CheckUnit) != O.m_Units.end();
+                if (O.m_Coverage == coverage_kind::Unknown) { P.m_Presence = presence::Unknown; continue; }
+                P.m_Presence = presence::NotObserved;                      // not seen: said nothing about being fixed unless it was really looked at
+                if (bChecked && O.m_Outcome == outcome::Succeeded && !O.m_bCollectorLoss && P.m_Verification != verification::Verified)
+                { P.m_Verification = verification::Verified; P.m_VerifiedBy = O.m_Id; }
+            }
         }
 
         void CommitEvent(event&& E) noexcept
@@ -684,7 +956,16 @@ namespace xlog
                 m_Segments.push_back({ E.m_Key.m_Sequence, {} });
                 m_Segments.back().m_Events.reserve(segment_size_v);
             }
+            if (m_pSink) m_pSink->Push(record(E));
             ++m_Counts[static_cast<int>(E.m_Severity)];
+            {
+                const std::size_t Second = static_cast<std::size_t>(E.m_ObservedAt / 1000000000ull);
+                if (Second < 1u << 20)                                   // a launch of twelve days: beyond that the strip stops growing
+                {
+                    if (Second >= m_Density.size()) m_Density.resize(Second + 1);
+                    ++m_Density[Second].m_Count; if (E.m_Severity > m_Density[Second].m_Worst) m_Density[Second].m_Worst = E.m_Severity;
+                }
+            }
             if (std::none_of(m_Origins.begin(), m_Origins.end(), [&](const origin& O) { return O.m_Name == E.m_Origin.m_Name && O.m_Type == E.m_Origin.m_Type; })) m_Origins.push_back({ E.m_Origin.m_Type, E.m_Origin.m_Name, 0 });
 
             if (E.m_Operation)
@@ -714,12 +995,29 @@ namespace xlog
             problem& P = It->second;
             if (bNew)
             {
+                if (!m_PriorVerified.empty())
+                {
+                    std::lock_guard Lock(m_InfoMutex);
+                    if (auto Prior = m_PriorVerified.find(Id); Prior != m_PriorVerified.end()) { P.m_PreviousSession = Prior->second; P.m_Regressions = 1; }
+                }
                 P.m_Id = Id; P.m_Producer = E.m_Producer; P.m_Code = E.m_Code; P.m_Title = E.m_Title; P.m_Channel = E.m_Channel; P.m_OriginName = E.m_Origin.m_Name;
                 P.m_FirstSeq = E.m_Key.m_Sequence; P.m_Site = E.m_Source;
                 if (!E.m_Subjects.empty()) P.m_Subject = E.m_Subjects[0];
                 P.m_Discriminator = E.m_Discriminator; P.m_bHeuristic = E.m_bHeuristic || E.m_Code.empty();
                 m_ProblemOrder.push_back(Id);
             }
+            const bool bNewOperation = E.m_Operation != 0 && E.m_Operation != P.m_LastOperation;
+            if (E.m_Operation)
+                if (auto Op = m_Operations.find(E.m_Operation); Op != m_Operations.end() && !Op->second.m_VerificationTarget.empty()) P.m_Target = Op->second.m_VerificationTarget;
+            if (!bNew && bNewOperation)
+            {
+                // It is back. After a verification that is a regression; after the person acknowledged it, it is recurring and asks for attention again.
+                if (P.m_Verification == verification::Verified) { ++P.m_Regressions; P.m_Verification = verification::Unverified; P.m_VerifiedBy = 0; }
+                if (auto A = m_Annotations.find(P.m_Id); A != m_Annotations.end() && A->second.m_bAcknowledged) { P.m_bRecurring = true; A->second.m_bAcknowledged = false; ++m_Revision; }
+            }
+            if (!bNew || bNewOperation) P.m_Presence = presence::Observed;
+            if (bNew) P.m_FirstAt = E.m_ObservedAt;
+            P.m_LastAt = E.m_ObservedAt;
             P.m_LastSeq = E.m_Key.m_Sequence; ++P.m_Count;
             if (E.m_Severity > P.m_Severity) P.m_Severity = E.m_Severity;
             if (P.m_First.size() < problem_retained_v) P.m_First.push_back(E.m_Key.m_Sequence);
@@ -756,7 +1054,25 @@ namespace xlog
         std::unordered_map<std::uint64_t, problem>   m_Problems;
         std::vector<std::uint64_t>  m_ProblemOrder;
         std::vector<origin>         m_Origins;
+        std::vector<density_bucket> m_Density;
+        std::shared_ptr<record_sink> m_pSink;
+        bool                        m_bPersistenceFailureReported = false;
+        mutable std::mutex          m_InfoMutex;
+        std::string                 m_PersistDir, m_ImportState;
+        std::unordered_map<std::uint64_t, std::string> m_PriorVerified;
+        mutable std::mutex          m_PolicyMutex;
+        std::vector<capture_rule>   m_Rules;
+        severity                    m_DefaultMin = severity::Debug;
+        std::atomic<std::uint64_t>  m_Excluded[6] = {};
+        std::vector<std::pair<std::string, recheck_fn>> m_Rechecks;
         std::unordered_map<std::uint64_t, annotation> m_Annotations;
+        std::vector<saved_view>     m_SavedViews;
+        std::vector<attachment>     m_Attachments;
+        std::function<std::string()> m_RemoteStatus;
+        dependency_provider         m_DependencyProvider;
+        std::unordered_map<std::string, std::vector<ref>> m_SimulatedDeps;
+        mutable std::unordered_map<std::string, std::pair<std::uint64_t, std::vector<ref>>> m_DepCache;
+        std::function<void()>       m_OnUserChange;
         std::uint64_t               m_Baseline = 0;
         std::uint64_t               m_Revision = 1;
     };
@@ -770,7 +1086,8 @@ namespace xlog
         if (!F.m_Code.empty() && P.m_Code != F.m_Code) return false;
         if (!F.m_Origins.empty() && std::find(F.m_Origins.begin(), F.m_Origins.end(), P.m_OriginName) == F.m_Origins.end()) return false;
         if (!F.m_Producer.empty() && P.m_Producer != F.m_Producer) return false;
-        if (!F.m_Asset.empty() && !details::RefMatchesAsset(P.m_Subject, F.m_Asset)) return false;
+        if (P.m_LastAt < F.m_TimeFrom || P.m_FirstAt > F.m_TimeTo) return false;           // seen at some time inside the range
+        if (!F.m_Asset.empty() && !details::AboutAsset(F, P.m_Subject)) return false;
         if (F.m_Operation)
         {
             const operation* O = H.FindOperation(F.m_Operation);

@@ -112,15 +112,7 @@ namespace xlog
         }
 
         // Text for a person or an AI to paste: what failed, where, how often, and the last occurrence in full.
-        inline std::string ContextPack(const hub& Hub, const problem& P) noexcept
-        {
-            std::string Out = std::format("{}{}\n", P.m_Code.empty() ? "" : P.m_Code + "  ", P.m_Title);
-            Out += std::format("severity={} occurrences={} channel={} producer={}\n", SeverityName(P.m_Severity), P.m_Count, P.m_Channel, P.m_Producer);
-            if (const std::string W = Where(P); !W.empty()) Out += std::format("where={}\n", W);
-            if (P.m_LastOperation) Out += std::format("operation={}\n", Breadcrumb(Hub, P.m_LastOperation));
-            if (const event* E = Hub.FindEvent(P.m_LastSeq); E && !E->m_Body.empty()) Out += E->m_Body + "\n";
-            return Out;
-        }
+        inline std::string ContextPack(const hub& Hub, const problem& P) noexcept { return BuildContextPack(Hub, P); }
 
         // Runs an annotation as the host's undoable command when it gave a runner; otherwise sets it on the hub directly.
         inline void Annotate(hub& Hub, const tab_options& Options, const char* pCommand, std::uint64_t Id, bool bValue, void (hub::*Direct)(std::uint64_t, bool) noexcept) noexcept
@@ -246,7 +238,7 @@ namespace xlog
         // the chips, the typed query and the pipe's LogProblems / LogEvents are always the same filter.
         inline void SetQueryText(view_state& State, const std::string& Query) noexcept { std::snprintf(State.m_Query, sizeof(State.m_Query), "%s", Query.c_str()); }
 
-        inline void LensBar(const hub& Hub, view_state& State) noexcept
+        inline void LensBar(const hub& Hub, view_state& State, const tab_options& Options) noexcept
         {
             // ---- Source
             std::vector<std::string> Chosen;
@@ -293,7 +285,8 @@ namespace xlog
             // ---- About
             ImGui::SameLine(0, 18.0f);
             const std::string Operation = QueryValue(State.m_Query, "op"), Asset = QueryValue(State.m_Query, "asset");
-            const std::string AboutLabel = !Operation.empty() ? "operation " + Operation : !Asset.empty() ? "asset " + Asset : "Anything";
+            const bool bDeps = QueryValue(State.m_Query, "deps") == "yes";
+            const std::string AboutLabel = !Operation.empty() ? "operation " + Operation : !Asset.empty() ? std::string(bDeps ? "asset+deps " : "asset ") + Asset : "Anything";
             ImGui::TextDisabled("About"); ImGui::SameLine();
             if (ImGui::SmallButton((AboutLabel + " v###aboutlens").c_str())) ImGui::OpenPopup("##aboutpopup");
             State.m_AboutChipAt[0] = ImGui::GetItemRectMin().x + ImGui::GetItemRectSize().x * 0.5f; State.m_AboutChipAt[1] = ImGui::GetItemRectMin().y + ImGui::GetItemRectSize().y * 0.5f;
@@ -305,18 +298,210 @@ namespace xlog
                 if (State.m_Page == 0) { if (const problem* P = Hub.FindProblem(State.m_Selected)) { SelOp = P->m_LastOperation; SelSubject = P->m_Subject; } }
                 else if (const event* E = Hub.FindEvent(State.m_SelectedEvent)) { SelOp = E->m_Operation; if (!E->m_Subjects.empty()) SelSubject = E->m_Subjects[0]; }
 
-                if (ImGui::Selectable("Anything", Operation.empty() && Asset.empty())) SetQueryText(State, WithQueryToken(WithQueryToken(State.m_Query, "op", {}), "asset", {}));
+                if (ImGui::Selectable("Anything", Operation.empty() && Asset.empty())) SetQueryText(State, WithQueryToken(WithQueryToken(WithQueryToken(State.m_Query, "op", {}), "asset", {}), "deps", {}));
                 ImGui::BeginDisabled(SelOp == 0);
                 if (ImGui::Selectable(SelOp ? std::format("This operation (#{})", SelOp).c_str() : "This operation", !Operation.empty()))
-                    SetQueryText(State, WithQueryToken(WithQueryToken(State.m_Query, "asset", {}), "op", std::to_string(SelOp)));
+                    SetQueryText(State, WithQueryToken(WithQueryToken(WithQueryToken(State.m_Query, "asset", {}), "deps", {}), "op", std::to_string(SelOp)));
                 ImGui::EndDisabled();
                 ImGui::BeginDisabled(!SelSubject.Valid());
                 const std::string AssetName = SelSubject.m_Path.empty() ? Hex16(SelSubject.m_Id) : SelSubject.m_Path;
-                if (ImGui::Selectable(SelSubject.Valid() ? std::format("This asset ({})", AssetName).c_str() : "This asset", !Asset.empty()))
-                    SetQueryText(State, WithQueryToken(WithQueryToken(State.m_Query, "op", {}), "asset", SelSubject.m_Id ? Hex16(SelSubject.m_Id) : SelSubject.m_Path));
+                if (ImGui::Selectable(SelSubject.Valid() ? std::format("This asset ({})", AssetName).c_str() : "This asset", !Asset.empty() && !bDeps))
+                    SetQueryText(State, WithQueryToken(WithQueryToken(WithQueryToken(State.m_Query, "op", {}), "deps", {}), "asset", SelSubject.m_Id ? Hex16(SelSubject.m_Id) : SelSubject.m_Path));
+                if (ImGui::Selectable(SelSubject.Valid() ? std::format("This asset and what it depends on ({})", AssetName).c_str() : "This asset and what it depends on", !Asset.empty() && bDeps))
+                    SetQueryText(State, WithQueryToken(WithQueryToken(WithQueryToken(State.m_Query, "op", {}), "deps", "yes"), "asset", SelSubject.m_Id ? Hex16(SelSubject.m_Id) : SelSubject.m_Path));
                 ImGui::EndDisabled();
                 if (SelOp == 0 && !SelSubject.Valid()) ImGui::TextDisabled("Select a row to be about what it is about.");
                 ImGui::EndPopup();
+            }
+
+            // ---- Views: the places the person (or the team) keeps. A click goes there (Back returns); the window as it is now is kept under a name.
+            ImGui::SameLine(0, 18.0f);
+            ImGui::TextDisabled("Views"); ImGui::SameLine();
+            if (ImGui::SmallButton(std::format("{} v###viewsmenu", Hub.SavedViews().empty() ? std::string("Saved") : std::format("{} saved", Hub.SavedViews().size())).c_str())) ImGui::OpenPopup("##viewspopup");
+            State.m_ViewsChipAt[0] = ImGui::GetItemRectMin().x + ImGui::GetItemRectSize().x * 0.5f; State.m_ViewsChipAt[1] = ImGui::GetItemRectMin().y + ImGui::GetItemRectSize().y * 0.5f;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keep the query, page and preset under a name. Team views are shared through the project's files.");
+            if (ImGui::BeginPopup("##viewspopup"))
+            {
+                std::string DeleteName;
+                for (const saved_view& V : Hub.SavedViews())
+                {
+                    ImGui::PushID(V.m_Name.c_str());
+                    if (ImGui::Selectable((V.m_Name + (V.m_bTeam ? "   (team)" : "")).c_str(), false, 0, ImVec2(220.0f, 0))) { State.Apply(V); ImGui::CloseCurrentPopup(); }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  ·  %s%s", V.m_Page == 0 ? "Problems" : "Events", V.m_Query.empty() ? "(no query)" : V.m_Query.c_str(), V.m_bShowMuted ? "  ·  muted shown" : "");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("x")) DeleteName = V.m_Name;
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Forget this view (Undo brings it back)");
+                    ImGui::PopID();
+                }
+                if (Hub.SavedViews().empty()) ImGui::TextDisabled("No saved views yet.");
+                ImGui::Separator();
+                static char Name[64] = {};
+                static bool bTeam = false;
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::InputTextWithHint("##viewname", "name of this view", Name, sizeof(Name));
+                ImGui::SameLine(); ImGui::Checkbox("Team", &bTeam);
+                const std::string Trimmed = [&] { std::string S(Name); while (!S.empty() && S.back() == ' ') S.pop_back(); return S; }();
+                const bool bValid = !Trimmed.empty() && Trimmed.find('"') == std::string::npos;
+                ImGui::BeginDisabled(!bValid);
+                if (ImGui::Button("Save this view") && Options.m_Run) { Options.m_Run(std::format("LogViewSave -Name \"{}\"{}", Trimmed, bTeam ? " -Team true" : "")); Name[0] = 0; }
+                ImGui::EndDisabled();
+                if (!DeleteName.empty() && Options.m_Run) Options.m_Run(std::format("LogViewDelete -Name \"{}\"", DeleteName));
+                ImGui::EndPopup();
+            }
+        }
+
+        // The ruler (documentation/Editors/DESIGN_logs.md, 6.4): the launch on a time axis. A density strip (events per second, the worst severity of each stretch coloured), the operations as
+        // spans in lanes (a failed one in red), the baseline. The wheel zooms around the pointer; dragging across it selects a range, which becomes the query's time:A-B (so the list below
+        // and LogEvents show the same); a click on a span selects its operation (op:N); a double click or a right click clears the range and shows the whole launch again.
+        // Drawing costs the width of the strip, not the number of events: the density was counted as the events came in.
+        inline void RenderRuler(const hub& Hub, view_state& State) noexcept
+        {
+            const float AxisH = ImGui::GetTextLineHeight() + 2.0f, DensityH = 24.0f, LaneH = 10.0f;
+            const auto Spans = ComputeSpans(Hub);
+            int Lanes = 0;
+            for (const auto& S : Spans) Lanes = std::max(Lanes, S.m_Lane + 1);
+            Lanes = std::min(Lanes, 3);
+            const float Width = std::max(60.0f, ImGui::GetContentRegionAvail().x), Height = AxisH + DensityH + static_cast<float>(Lanes) * LaneH + 4.0f;
+
+            const std::uint64_t Now = std::max<std::uint64_t>(Hub.Now(), 2000000000ull);
+            std::uint64_t T0 = State.m_RulerFrom, T1 = State.m_RulerTo;
+            if (T1 <= T0) { T0 = 0; T1 = Now; }
+            const double Span = static_cast<double>(T1 - T0);
+
+            const ImVec2 P0 = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton("##ruler", ImVec2(Width, Height));
+            const bool bHovered = ImGui::IsItemHovered();
+            ImDrawList* pList = ImGui::GetWindowDrawList();
+            const auto XOf = [&](std::uint64_t T) { return P0.x + static_cast<float>((static_cast<double>(T) - static_cast<double>(T0)) / Span) * Width; };
+            const auto TOf = [&](float X) { return static_cast<std::uint64_t>(std::max(0.0, static_cast<double>(T0) + static_cast<double>((X - P0.x) / Width) * Span)); };
+            State.m_RulerAt[0] = P0.x; State.m_RulerAt[1] = P0.y + AxisH; State.m_RulerAt[2] = P0.x + Width; State.m_RulerAt[3] = P0.y + AxisH + DensityH;
+
+            const ImU32 Frame = ImGui::GetColorU32(ImGuiCol_FrameBg), Muted = ImGui::GetColorU32(ImGuiCol_TextDisabled), TextCol = ImGui::GetColorU32(ImGuiCol_Text);
+            pList->AddRectFilled(P0, ImVec2(P0.x + Width, P0.y + Height), Frame, 3.0f);
+            pList->PushClipRect(P0, ImVec2(P0.x + Width, P0.y + Height), true);
+
+            // the axis: a tick every step seconds, the step the first of 1 2 5 10 30 60 ... that leaves the labels room
+            {
+                static constexpr double Steps[] = { 0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600 };
+                double Step = Steps[std::size(Steps) - 1];
+                for (double S : Steps) if (S / (Span / 1.0e9) * Width >= 64.0) { Step = S; break; }
+                for (double T = std::ceil(static_cast<double>(T0) / 1.0e9 / Step) * Step; T * 1.0e9 <= static_cast<double>(T1); T += Step)
+                {
+                    const float X = XOf(static_cast<std::uint64_t>(T * 1.0e9));
+                    pList->AddLine(ImVec2(X, P0.y + AxisH - 4.0f), ImVec2(X, P0.y + AxisH), Muted);
+                    const std::string Label = T >= 60 ? std::format("{}:{:02}", static_cast<int>(T) / 60, static_cast<int>(T) % 60) : Step < 1 ? std::format("{:.1f}s", T) : std::format("{}s", static_cast<int>(T));
+                    pList->AddText(ImVec2(X + 3.0f, P0.y), Muted, Label.c_str());
+                }
+            }
+
+            // the density: per pixel column the seconds that fall in it, the number of events (a log scale) and the worst severity
+            {
+                const auto& D = Hub.Density();
+                std::uint32_t MaxCount = 1;
+                const int Columns = static_cast<int>(Width);
+                std::vector<std::pair<std::uint32_t, severity>> Col(static_cast<std::size_t>(Columns), { 0u, severity::Trace });
+                for (std::size_t Sec = static_cast<std::size_t>(T0 / 1000000000ull); Sec < D.size() && static_cast<std::uint64_t>(Sec) * 1000000000ull <= T1; ++Sec)
+                {
+                    if (!D[Sec].m_Count) continue;
+                    const float X = XOf(static_cast<std::uint64_t>(Sec) * 1000000000ull) - P0.x;
+                    const int C = std::clamp(static_cast<int>(X), 0, Columns - 1);
+                    Col[static_cast<std::size_t>(C)].first += D[Sec].m_Count;
+                    if (D[Sec].m_Worst > Col[static_cast<std::size_t>(C)].second) Col[static_cast<std::size_t>(C)].second = D[Sec].m_Worst;
+                    MaxCount = std::max(MaxCount, Col[static_cast<std::size_t>(C)].first);
+                }
+                const float Base = P0.y + AxisH + DensityH;
+                for (int C = 0; C < Columns; ++C)
+                {
+                    if (!Col[static_cast<std::size_t>(C)].first) continue;
+                    const float H = std::max(2.0f, DensityH * std::log1p(static_cast<float>(Col[static_cast<std::size_t>(C)].first)) / std::log1p(static_cast<float>(MaxCount)));
+                    const severity Worst = Col[static_cast<std::size_t>(C)].second;
+                    pList->AddRectFilled(ImVec2(P0.x + static_cast<float>(C), Base - H), ImVec2(P0.x + static_cast<float>(C) + 1.0f, Base), Worst >= severity::Warning ? SeverityColor(Worst) : IM_COL32(120, 120, 128, 255));
+                }
+            }
+
+            // the operations: bars in lanes
+            const operation* pHoverOp = nullptr;
+            for (const auto& S : Spans)
+            {
+                if (S.m_Lane >= Lanes || S.m_End < T0 || S.m_Start > T1) continue;
+                const float X0 = std::clamp(XOf(S.m_Start), P0.x, P0.x + Width), X1 = std::clamp(XOf(S.m_End), P0.x, P0.x + Width);
+                const float Y0 = P0.y + AxisH + DensityH + static_cast<float>(S.m_Lane) * LaneH + 1.0f;
+                const ImU32 Col = S.m_Outcome == outcome::Failed ? IM_COL32(190, 90, 88, 255) : S.m_Outcome == outcome::Running ? IM_COL32(95, 140, 200, 255)
+                                : S.m_Outcome == outcome::Succeeded ? IM_COL32(105, 150, 115, 255) : IM_COL32(170, 150, 90, 255);
+                pList->AddRectFilled(ImVec2(X0, Y0), ImVec2(std::max(X1, X0 + 2.0f), Y0 + LaneH - 2.0f), Col, 2.0f);
+                if (X1 - X0 > 56.0f) { pList->PushClipRect(ImVec2(X0, Y0), ImVec2(X1, Y0 + LaneH), true); pList->AddText(ImVec2(X0 + 3.0f, Y0 - 2.0f), IM_COL32(20, 20, 24, 255), (S.m_Kind + (S.m_Outcome == outcome::Failed ? " x" : "")).c_str()); pList->PopClipRect(); }
+                const ImVec2 M = ImGui::GetMousePos();
+                if (bHovered && M.x >= X0 && M.x <= std::max(X1, X0 + 2.0f) && M.y >= Y0 && M.y <= Y0 + LaneH) pHoverOp = Hub.FindOperation(S.m_Id);
+            }
+
+            // the baseline, and the range a time: token already selects
+            if (Hub.Baseline()) if (const event* E = Hub.FindEvent(Hub.Baseline()))
+            {
+                const float X = XOf(E->m_ObservedAt);
+                if (X >= P0.x && X <= P0.x + Width) pList->AddTriangleFilled(ImVec2(X, P0.y + AxisH - 1.0f), ImVec2(X - 4.0f, P0.y + 1.0f), ImVec2(X + 4.0f, P0.y + 1.0f), IM_COL32(200, 200, 90, 255));
+            }
+            {
+                const filter F = ParseQuery(State.m_Query);
+                if (F.m_Error.empty() && (F.m_TimeFrom != 0 || F.m_TimeTo != ~0ull))
+                {
+                    const float X0 = std::clamp(XOf(F.m_TimeFrom), P0.x, P0.x + Width), X1 = std::clamp(F.m_TimeTo == ~0ull ? P0.x + Width : XOf(F.m_TimeTo), P0.x, P0.x + Width);
+                    pList->AddRectFilled(ImVec2(X0, P0.y), ImVec2(std::max(X1, X0 + 1.0f), P0.y + Height), IM_COL32(95, 140, 200, 55));
+                    pList->AddRect(ImVec2(X0, P0.y), ImVec2(std::max(X1, X0 + 1.0f), P0.y + Height), IM_COL32(95, 140, 200, 200));
+                }
+            }
+            // the rubber band of a drag in progress
+            const ImGuiIO& IO = ImGui::GetIO();
+            const bool bDragging = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 3.0f);
+            if (bDragging)
+            {
+                const float A = std::clamp(IO.MouseClickedPos[0].x, P0.x, P0.x + Width), B = std::clamp(IO.MousePos.x, P0.x, P0.x + Width);
+                pList->AddRectFilled(ImVec2(std::min(A, B), P0.y), ImVec2(std::max(A, B), P0.y + Height), IM_COL32(255, 255, 255, 40));
+            }
+            pList->PopClipRect();
+
+            // the pointer: the time under it, the operation under it
+            if (bHovered && !bDragging)
+            {
+                const std::uint64_t T = TOf(IO.MousePos.x);
+                const std::size_t Sec = static_cast<std::size_t>(T / 1000000000ull);
+                const auto& D = Hub.Density();
+                ImGui::BeginTooltip();
+                if (pHoverOp) ImGui::Text("%s  #%llu  %s", pHoverOp->m_Title.empty() ? pHoverOp->m_Kind.c_str() : pHoverOp->m_Title.c_str(), static_cast<unsigned long long>(pHoverOp->m_Id), OutcomeName(pHoverOp->m_Outcome));
+                else ImGui::Text("%s  ·  %u event%s that second", ClockText(T).c_str(), Sec < D.size() ? D[Sec].m_Count : 0u, Sec < D.size() && D[Sec].m_Count == 1 ? "" : "s");
+                ImGui::TextDisabled("Wheel zooms. Drag selects a range. Click a bar for its operation. Double click shows it all.");
+                ImGui::EndTooltip();
+            }
+
+            // the wheel zooms around the pointer
+            if (bHovered && IO.MouseWheel != 0.0f)
+            {
+                const double Factor = IO.MouseWheel > 0 ? 0.75 : 1.0 / 0.75;
+                const double Centre = static_cast<double>(TOf(IO.MousePos.x));
+                double A = Centre - (Centre - static_cast<double>(T0)) * Factor, B = Centre + (static_cast<double>(T1) - Centre) * Factor;
+                A = std::max(A, 0.0); B = std::min(B, static_cast<double>(Now));
+                if (B - A < 2.0e8) { A = Centre - 1.0e8; B = Centre + 1.0e8; }
+                if (B - A >= static_cast<double>(Now) * 0.999) { State.m_RulerFrom = State.m_RulerTo = 0; }
+                else { State.m_RulerFrom = static_cast<std::uint64_t>(std::max(A, 0.0)); State.m_RulerTo = static_cast<std::uint64_t>(B); }
+            }
+
+            // a drag selects a range; a click on a bar, its operation; a double click or the right button, everything again
+            if (ImGui::IsItemDeactivated() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 3.0f) == false && IO.MouseDragMaxDistanceSqr[0] > 9.0f)
+            {
+                const std::uint64_t A = TOf(IO.MouseClickedPos[0].x), B = TOf(IO.MousePos.x);
+                const std::uint64_t Lo = std::min(A, B), Hi = std::max(A, B);
+                if (Hi - Lo > 20000000ull) SetQueryText(State, WithQueryToken(State.m_Query, "time", std::format("{:.2f}-{:.2f}", static_cast<double>(Lo) / 1.0e9, static_cast<double>(Hi) / 1.0e9)));
+            }
+            else if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            {
+                SetQueryText(State, WithQueryToken(State.m_Query, "time", {}));
+                State.m_RulerFrom = State.m_RulerTo = 0;
+            }
+            else if (ImGui::IsItemDeactivated() && pHoverOp && IO.MouseDragMaxDistanceSqr[0] <= 9.0f && ImGui::IsItemHovered())
+                SetQueryText(State, WithQueryToken(State.m_Query, "op", std::to_string(pHoverOp->m_Id)));
+            if (bHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+            {
+                SetQueryText(State, WithQueryToken(State.m_Query, "time", {}));
+                State.m_RulerFrom = State.m_RulerTo = 0;
             }
         }
 
@@ -346,7 +531,7 @@ namespace xlog
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Everything so far stops being New.");
             if (!State.m_QueryError.empty()) { ImGui::PushStyleColor(ImGuiCol_Text, SeverityColor(severity::Error)); ImGui::TextUnformatted(State.m_QueryError.c_str()); ImGui::PopStyleColor(); }
-            LensBar(Hub, State);
+            LensBar(Hub, State, Options);
 
             const float FooterH = ImGui::GetTextLineHeightWithSpacing() + 4.0f;
             if (ImGui::BeginChild("problems", ImVec2(0, -FooterH), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar))
@@ -465,9 +650,10 @@ namespace xlog
         inline constexpr int event_body_lines_shown_v = 80;
 
         // Lines in the block an open event shows (every one is a text line high).
-        inline int OpenEventLines(const event& E) noexcept
+        inline int OpenEventLines(const hub& Hub, const event& E) noexcept
         {
             int Lines = 1;                                                        // where and when
+            for (const auto& A : Hub.Attachments()) if (A.m_Event == E.m_Key.m_Sequence) ++Lines;     // a button each
             if (E.m_Operation) ++Lines;                                           // the operation it belongs to
             Lines += static_cast<int>(E.m_Attributes.size());
             Lines += static_cast<int>(std::min<std::uint32_t>(E.m_BodyLines, event_body_lines_shown_v));
@@ -488,7 +674,8 @@ namespace xlog
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hides what is listed. The events stay in the Logs.");
             if (!State.m_QueryError.empty()) { ImGui::PushStyleColor(ImGuiCol_Text, SeverityColor(severity::Error)); ImGui::TextUnformatted(State.m_QueryError.c_str()); ImGui::PopStyleColor(); }
 
-            LensBar(Hub, State);
+            LensBar(Hub, State, Options);
+            RenderRuler(Hub, State);
 
             const float FooterH = ImGui::GetTextLineHeightWithSpacing() + 4.0f;
             const auto SelectedCount = [&]() -> std::size_t { return State.SelectedEvents().size(); };
@@ -519,7 +706,7 @@ namespace xlog
                 {
                     const auto It = std::lower_bound(State.m_EventRows.begin(), State.m_EventRows.end(), Seq);
                     if (It == State.m_EventRows.end() || *It != Seq) continue;
-                    if (const event* E = Hub.FindEvent(Seq)) OpenBlocks.push_back({ static_cast<std::size_t>(It - State.m_EventRows.begin()), OpenEventLines(*E) * LH + Pad * 2.0f });
+                    if (const event* E = Hub.FindEvent(Seq)) OpenBlocks.push_back({ static_cast<std::size_t>(It - State.m_EventRows.begin()), OpenEventLines(Hub, *E) * LH + Pad * 2.0f });
                 }
                 std::sort(OpenBlocks.begin(), OpenBlocks.end(), [](const open_block& A, const open_block& B) { return A.m_Index < B.m_Index; });
                 float ExtraTotal = 0.0f;
@@ -617,7 +804,7 @@ namespace xlog
                     // the open block
                     if (bOpen)
                     {
-                        const float BlockH = OpenEventLines(*E) * LH + Pad * 2.0f;
+                        const float BlockH = OpenEventLines(Hub, *E) * LH + Pad * 2.0f;
                         const float X0 = Min.x + Arrow + Time;
                         float LineY = Min.y + LH + Pad;
                         auto Line = [&](const std::string& Text, ImU32 Col)
@@ -647,6 +834,15 @@ namespace xlog
                                 Start = Eol + 1;
                             }
                             if (E->m_BodyLines > event_body_lines_shown_v) Line(std::format("... {} more lines (LogEvent -Id {} -Offset {} reads them)", E->m_BodyLines - event_body_lines_shown_v, Seq, event_body_lines_shown_v), Muted);
+                        }
+                        for (const auto& A : Hub.Attachments())
+                        {
+                            if (A.m_Event != E->m_Key.m_Sequence) continue;
+                            ImGui::SetCursorScreenPos(ImVec2(X0, LineY));
+                            ref File; File.m_Type = ref::type::File; File.m_Path = A.m_Path;
+                            if (ImGui::SmallButton(std::format("{}  ({} KB)##att{}", A.m_Name, (A.m_Bytes + 1023) / 1024, A.m_Id).c_str())) Open(Options, File);
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Attached file: %s", A.m_Path.c_str());
+                            LineY += LH;
                         }
                         if (E->m_Source.Valid())          // the one action of an event (Copy, Open and Close are the menu's, for the whole selection)
                         {

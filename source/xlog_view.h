@@ -11,6 +11,132 @@
 
 namespace xlog
 {
+    // "00:11.162": the time since the session started, as a clock
+    inline std::string ClockText(std::uint64_t Ns) noexcept
+    {
+        const std::uint64_t Ms = Ns / 1000000ull;
+        return std::format("{:02}:{:02}.{:03}", Ms / 60000, (Ms / 1000) % 60, Ms % 1000);
+    }
+
+    // Where a typed reference points, in words: "soccer_player_system.h:80:17", "asset Face (00000000D896E5)"
+    inline std::string DescribeRef(const ref& R) noexcept
+    {
+        if (!R.Valid()) return {};
+        static constexpr const char* Types[] = { "none", "asset", "entity", "file", "graph", "operation", "object" };
+        std::string Text = std::format("{} {}", Types[static_cast<int>(R.m_Type)], R.m_Path);
+        if (R.m_Line > 0) Text += std::format(":{}{}", R.m_Line, R.m_Column > 0 ? std::format(":{}", R.m_Column) : std::string());
+        if (R.m_Id) Text += std::format(" (id {})", Hex16(R.m_Id));
+        if (R.m_Revision) Text += std::format(" (revision {})", R.m_Revision);
+        return Text;
+    }
+
+    // The context pack of a problem (design 7.2): what a person or an AI needs to understand it, deterministic (the same store gives the same text), stable ids, bounded by Budget
+    // bytes, and honest about what is missing. Sections are in order of importance, so a small budget cuts the least important first.
+    inline std::string BuildContextPack(const hub& Hub, const problem& P, std::size_t Budget = 8192) noexcept
+    {
+        std::string Out;
+        bool bCut = false;
+        auto Add = [&](const std::string& Text) { if (bCut) return; if (Out.size() + Text.size() > Budget) { bCut = true; return; } Out += Text; };
+        const annotation A = Hub.Annotation(P.m_Id);
+
+        Add(std::format("Problem={}  Severity={}  Code={}  Heuristic={}\nProducer={}  Channel={}  Origin={}\nTitle={}\n", Hex16(P.m_Id), SeverityName(P.m_Severity), P.m_Code.empty() ? "-" : P.m_Code
+            , P.m_bHeuristic ? "true" : "false", P.m_Producer, P.m_Channel, P.m_OriginName, P.m_Title));
+        Add(std::format("State: Triage={}  Verification={}  Suppression={}  RunPresence={}  Regressions={}  Recurring={}\n", A.m_bAcknowledged ? "Acknowledged" : "Unreviewed"
+            , VerificationName(P.m_Verification), A.m_bMuted ? "Muted" : "None", PresenceName(P.m_Presence), P.m_Regressions, P.m_bRecurring ? "true" : "false"));
+        if (P.m_Verification == verification::Verified) Add(std::format("VerifiedBy=operation {}\n", P.m_VerifiedBy));
+        if (!P.m_PreviousSession.empty()) Add(std::format("Verified resolved in the earlier launch {}: this is a regression across launches\n", P.m_PreviousSession));
+        if (P.m_Site.Valid())    Add("Source: " + DescribeRef(P.m_Site) + "\n");
+        if (P.m_Subject.Valid()) Add("About: " + DescribeRef(P.m_Subject) + "\n");
+        if (!P.m_CheckUnit.empty()) Add("CheckUnit=" + P.m_CheckUnit + "\n");
+
+        const auto Retained = P.m_First.size() + P.m_Last.size();
+        Add(std::format("Evidence: observed {}, retained {} ({}); first seen at event {}, last at event {}\n", P.m_Count, Retained, Retained < P.m_Count ? "summarized, the rest are counted" : "full", P.m_FirstSeq, P.m_LastSeq));
+
+        // the operation chain, outermost first, with what each one says about its own evidence
+        if (P.m_LastOperation)
+        {
+            std::vector<const operation*> Chain;
+            for (std::uint64_t Id = P.m_LastOperation; Id && Chain.size() < 6; )
+            {
+                const operation* O = Hub.FindOperation(Id);
+                if (!O) break;
+                Chain.push_back(O);
+                Id = O->m_Parent;
+            }
+            Add("Operations:\n");
+            for (auto It = Chain.rbegin(); It != Chain.rend(); ++It)
+            {
+                const operation& O = **It;
+                Add(std::format("  #{} {}  {}  EvidenceReady={}  Coverage={}  Units={}  Target={}  {}ms{}\n", O.m_Id, O.m_Kind, OutcomeName(O.m_Outcome), O.m_bEvidenceReady ? "true" : "false", CoverageName(O.m_Coverage)
+                    , O.m_Units.size(), O.m_VerificationTarget.empty() ? "-" : O.m_VerificationTarget, ((O.m_Ended ? O.m_Ended : O.m_Started) - O.m_Started) / 1000000, O.m_bCollectorLoss ? "  CollectorLoss=true" : ""));
+            }
+        }
+
+        // the occurrences that were kept: the first ones and the latest, with their whole bodies
+        std::vector<std::uint64_t> Seqs = P.m_First;
+        Seqs.insert(Seqs.end(), P.m_Last.begin(), P.m_Last.end());
+        std::sort(Seqs.begin(), Seqs.end());
+        Seqs.erase(std::unique(Seqs.begin(), Seqs.end()), Seqs.end());
+        bool bExpired = false;
+        Add("Occurrences kept:\n");
+        for (auto Seq : Seqs)
+        {
+            const event* E = Hub.FindEvent(Seq);
+            if (!E) { bExpired = true; continue; }
+            Add(std::format("  event {}  {}  {}\n", Seq, ClockText(E->m_ObservedAt), E->m_Title));
+            std::size_t Start = 0;
+            while (!E->m_Body.empty() && Start <= E->m_Body.size())
+            {
+                const auto Eol = E->m_Body.find('\n', Start);
+                Add(std::string("      ") + E->m_Body.substr(Start, Eol == std::string::npos ? std::string::npos : Eol - Start) + "\n");
+                if (Eol == std::string::npos) break;
+                Start = Eol + 1;
+            }
+        }
+
+        // what was going on around the last occurrence
+        if (P.m_LastSeq)
+        {
+            Add(std::format("Around the last occurrence (event {}):\n", P.m_LastSeq));
+            const std::uint64_t From = P.m_LastSeq > 6 ? P.m_LastSeq - 6 : 0;
+            Hub.ForEachEvent(From, P.m_LastSeq + 5, [&](const event& C) { Add(std::format("  {}{}  {}  {}  {}\n", C.m_Key.m_Sequence == P.m_LastSeq ? "> " : "  ", C.m_Key.m_Sequence, SeverityName(C.m_Severity), C.m_Channel, C.m_Title)); return !bCut; });
+        }
+
+        const status S = Hub.Status();
+        std::uint64_t Dropped = 0;
+        for (auto D : S.m_Dropped) Dropped += D;
+        Add(std::format("Session={}  Events={}\n", Hex16(Hub.Session()), S.m_Events));
+        std::string Missing;
+        if (Retained < P.m_Count) Missing += std::format(" summarized({} occurrences counted, not kept)", P.m_Count - Retained);
+        if (bExpired) Missing += " expired(an occurrence left the store)";
+        if (Dropped) Missing += std::format(" dropped({} low-level events were not collected)", Dropped);
+        if (S.m_Expired) Missing += std::format(" expired-events({})", S.m_Expired);
+        Add("Missing:" + (Missing.empty() ? std::string(" nothing known") : Missing) + "\n");
+        if (bCut) Out += std::format("... context cut at the budget of {} bytes\n", Budget);
+        return Out;
+    }
+
+    // The operations as spans on the ruler (design 6.4): bars in lanes, an operation that overlaps another one a lane lower (a child is inside its parent, so it is below it).
+    struct ruler_span { std::uint64_t m_Id = 0, m_Start = 0, m_End = 0; int m_Lane = 0; outcome m_Outcome = outcome::Running; std::string m_Kind, m_Title; };
+    inline std::vector<ruler_span> ComputeSpans(const hub& Hub, std::size_t Max = 400) noexcept
+    {
+        std::vector<ruler_span> Spans;
+        const auto& Order = Hub.OperationOrder();
+        for (std::size_t i = Order.size() > Max ? Order.size() - Max : 0; i < Order.size(); ++i)
+            if (const operation* O = Hub.FindOperation(Order[i]))
+                Spans.push_back({ O->m_Id, O->m_Started, O->m_Ended ? O->m_Ended : Hub.Now(), 0, O->m_Outcome, O->m_Kind, O->m_Title.empty() ? O->m_Kind : O->m_Title });
+        std::stable_sort(Spans.begin(), Spans.end(), [](const ruler_span& A, const ruler_span& B) { return A.m_Start < B.m_Start; });
+        std::vector<std::uint64_t> LaneEnd;                                  // when each lane is free again
+        for (auto& S : Spans)
+        {
+            std::size_t Lane = 0;
+            while (Lane < LaneEnd.size() && LaneEnd[Lane] > S.m_Start) ++Lane;
+            if (Lane == LaneEnd.size()) LaneEnd.push_back(0);
+            LaneEnd[Lane] = S.m_End; S.m_Lane = static_cast<int>(Lane);
+        }
+        return Spans;
+    }
+
     // Where the window was: what Back returns to. Navigation that moves the person somewhere else in the Logs (Feedback of an editor, "Show in Events") pushes one,
     // so the way back to what they were doing is one click.
     struct view_snapshot
@@ -87,13 +213,6 @@ namespace xlog
         return C;
     }
 
-    // "00:11.162": the time since the session started, as a clock
-    inline std::string ClockText(std::uint64_t Ns) noexcept
-    {
-        const std::uint64_t Ms = Ns / 1000000ull;
-        return std::format("{:02}:{:02}.{:03}", Ms / 60000, (Ms / 1000) % 60, Ms % 1000);
-    }
-
     // The events as plain text, to paste into any application: one header line each (time, severity, channel, title, code) and the body under it, indented. The window's
     // Copy and the pipe's LogCopy are this one function, so what is on the clipboard is what a script reads.
     inline std::string FormatEventsForCopy(const hub& Hub, const std::vector<std::uint64_t>& Sequences) noexcept
@@ -137,6 +256,9 @@ namespace xlog
         float           m_BadgeAt[2]       = { -1.0f, -1.0f };  // where the badge was last drawn (a test clicks it); -1 = not drawn
         float           m_SourceChipAt[2]  = { -1.0f, -1.0f };  // where the two lens chips were last drawn (a test clicks them)
         float           m_AboutChipAt[2]   = { -1.0f, -1.0f };
+        float           m_ViewsChipAt[2]   = { -1.0f, -1.0f };
+        float           m_RulerAt[4]       = { -1.0f, -1.0f, -1.0f, -1.0f };  // the ruler's strip last drawn (x0, y0, x1, y1, screen): a test drags across it
+        std::uint64_t   m_RulerFrom = 0, m_RulerTo = 0;                      // what part of the launch the ruler shows (collector clock ns); 0..0 = all of it
         float           m_MouseAt[2]       = { -1.0f, -1.0f };  // where the window last saw the pointer (ImGui's idea of it): a test aims its clicks by the difference
         bool            m_bScrollToSelected = false;        // the selected problem was just opened: bring it to the top so its details are in view
         std::vector<std::uint64_t> m_Expanded;              // problems whose details are open inline
@@ -188,6 +310,19 @@ namespace xlog
             m_View = S.m_View; m_bShowMuted = S.m_bShowMuted; m_Selected = S.m_Selected; m_SelectedEvent = S.m_SelectedEvent;
             m_RequestPage = S.m_Page;
             m_Expanded.clear();
+        }
+
+        // The window as a view the person keeps / a kept view put on the window (what was in front is a Back entry: a view is a place to go, not a loss).
+        saved_view ToSaved(std::string Name, bool bTeam) const noexcept
+        {
+            saved_view V; V.m_Name = std::move(Name); V.m_Query = m_Query; V.m_Page = m_RequestPage >= 0 ? m_RequestPage : m_Page; V.m_State = static_cast<std::uint8_t>(m_View); V.m_bShowMuted = m_bShowMuted; V.m_bTeam = bTeam;
+            return V;
+        }
+        void Apply(const saved_view& V) noexcept
+        {
+            PushBack();
+            view_snapshot S; S.m_Query = V.m_Query; S.m_Page = V.m_Page; S.m_View = static_cast<problem_view>(std::min<int>(V.m_State, 2)); S.m_bShowMuted = V.m_bShowMuted;
+            Restore(S);
         }
 
         // Puts the window back where it was and hands the entry over (the host restores what it had in front). False when there is nowhere to go back to.
@@ -256,7 +391,7 @@ namespace xlog
         const bool bSameInputs = Key == State.m_RowsKey;
         if (bSameInputs && Hub.Revision() == State.m_RowsRevision && !bRefresh) return;
 
-        filter F = ParseQuery(State.m_Query);
+        filter F = Hub.Parse(State.m_Query);
         State.m_QueryError = F.m_Error;
         State.m_RowsKey = Key;
         State.m_RowsRevision = Hub.Revision();
@@ -312,7 +447,7 @@ namespace xlog
             State.m_EventNew = 0;
         }
         const std::uint64_t Committed = Hub.Committed();
-        filter F = ParseQuery(State.m_Query);
+        filter F = Hub.Parse(State.m_Query);
         State.m_QueryError = F.m_Error;
         if (!F.m_Error.empty()) { State.m_EventRows.clear(); State.m_EventScanned = Committed; return; }
         const std::uint64_t Oldest = Committed > Window ? Committed - Window : 0;
