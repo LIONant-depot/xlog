@@ -119,9 +119,12 @@ namespace xlog::commands
             for (auto D : S.m_Dropped) Dropped += D;
 
             std::string Out = Header("LogStatus", H);
+            { std::string O; for (const auto& Origin : H.Origins()) O += (O.empty() ? "" : ",") + std::string(OriginTypeName(Origin.m_Type)) + ":" + Origin.m_Name; Out += "Origins=" + O + "\n"; }
             Out += std::format("Started={}ms  Events={}  Problems={}  Operations={}  Capacity={}  Backlog={}\n", H.StartWallMs(), S.m_Events, S.m_Problems, S.m_Operations, S.m_Capacity, S.m_Backlog);
             Out += std::format("EventsBy: trace={} debug={} info={} warning={} error={} fatal={}\n", S.m_BySeverity[0], S.m_BySeverity[1], S.m_BySeverity[2], S.m_BySeverity[3], S.m_BySeverity[4], S.m_BySeverity[5]);
             Out += std::format("ProblemsBy: warning={} error={} fatal={}\n", S.m_ProblemsBySeverity[3], S.m_ProblemsBySeverity[4], S.m_ProblemsBySeverity[5]);
+            const badge_counts B = CountBadge(H);
+            Out += std::format("Badge: errors={} warnings={} new={} critical={}\n", B.m_Errors, B.m_Warnings, B.m_New, B.m_Critical);
             Out += std::format("Dropped={}  Expired={}  Excluded=none  PendingWrite=0  PersistenceFailed=false\n", Dropped, S.m_Expired);
             for (auto It = H.OperationOrder().rbegin(); It != H.OperationOrder().rend(); ++It)
             {
@@ -424,12 +427,12 @@ namespace xlog::commands
         {
             const view_state* pView = m_Get ? m_Get() : nullptr;
             if (!pView) return "LogWindow: no window";
-            return std::format("LogWindow: ok\nPage={}  State={}  ShowMuted={}  Follow={}\nSelected={}  SelectedEvent={}\nBack={}\nBackDepth={}  ForwardDepth={}  BackAt={:.0f},{:.0f}  ForwardAt={:.0f},{:.0f}  MouseAt={:.0f},{:.0f}\nEventsOpen={}  SelectedRange={}..{}  EventArrowAt={:.0f},{:.0f}  EventRowAt={:.0f},{:.0f}  EventStride={:.0f}\nQuery={}\n"
+            return std::format("LogWindow: ok\nPage={}  State={}  ShowMuted={}  Follow={}\nSelected={}  SelectedEvent={}\nBack={}\nBackDepth={}  ForwardDepth={}  BackAt={:.0f},{:.0f}  ForwardAt={:.0f},{:.0f}  MouseAt={:.0f},{:.0f}\nBadgeAt={:.0f},{:.0f}  SourceChipAt={:.0f},{:.0f}  AboutChipAt={:.0f},{:.0f}  EventsOpen={}  SelectedRange={}..{}  EventArrowAt={:.0f},{:.0f}  EventRowAt={:.0f},{:.0f}  EventStride={:.0f}\nQuery={}\n"
                 , (pView->m_RequestPage >= 0 ? pView->m_RequestPage : pView->m_Page) == 0 ? "Problems" : "Events", ProblemViewName(pView->m_View)       // where it is, or where it is about to be
                 , pView->m_bShowMuted, pView->m_bFollow, pView->m_Selected ? Hex16(pView->m_Selected) : std::string("none"), pView->m_SelectedEvent
                 , pView->m_Back.empty() ? std::string("none") : pView->m_Back.back().m_Label, pView->m_Back.size(), pView->m_Forward.size()
                 , pView->m_BackButton[0], pView->m_BackButton[1], pView->m_ForwardButton[0], pView->m_ForwardButton[1], pView->m_MouseAt[0], pView->m_MouseAt[1]
-                , pView->m_ExpandedEvents.size(), pView->m_SelFrom, pView->m_SelTo, pView->m_EventArrowAt[0], pView->m_EventArrowAt[1], pView->m_EventRowAt[0], pView->m_EventRowAt[1], pView->m_EventStride, pView->m_Query);       // the buttons' centres (-1 = not drawn): a test clicks there
+                , pView->m_BadgeAt[0], pView->m_BadgeAt[1], pView->m_SourceChipAt[0], pView->m_SourceChipAt[1], pView->m_AboutChipAt[0], pView->m_AboutChipAt[1], pView->m_ExpandedEvents.size(), pView->m_SelFrom, pView->m_SelTo, pView->m_EventArrowAt[0], pView->m_EventArrowAt[1], pView->m_EventRowAt[0], pView->m_EventRowAt[1], pView->m_EventStride, pView->m_Query);       // the buttons' centres (-1 = not drawn): a test clicks there
         }
     };
 
@@ -487,6 +490,37 @@ namespace xlog::commands
             return "LogEventsAction: -Action must be copy, open or close";
         }
         xcmdline::parser::handle m_hAction;
+    };
+
+    // The Source and About lenses as a command: the same edit of the query's tokens the two chips make. -Origin a,b (or all), -About anything | op:N | asset:X.
+    struct lens_cmd : log_query
+    {
+        std::function<view_state*()> m_Get;
+        lens_cmd(xundo::system& System, std::function<view_state*()> Get) noexcept : log_query(System, "LogLens"), m_Get(std::move(Get)) { RegisterArguments(); }
+        const char* getCommandHelp() const noexcept override { return "Sets the Logs window's Source and About lenses (they are tokens of its query). Usage: LogLens [-Origin names|all] [-About anything|op:N|asset:X]"; }
+        void RegisterArguments() noexcept override
+        {
+            m_hOrigin = m_Parser.addOption("Origin", "Origin names, comma separated, or all", false, 1);
+            m_hAbout = m_Parser.addOption("About", "anything, op:N or asset:X (an id or part of a name)", false, 1);
+        }
+        std::string Query() noexcept override
+        {
+            view_state* pView = m_Get ? m_Get() : nullptr;
+            if (!pView) return "LogLens: no window";
+            std::string Text, Query = pView->m_Query;
+            if (Arg(m_hOrigin, Text)) Query = WithQueryToken(Query, "origin", Text == "all" ? std::string_view{} : std::string_view(Text));
+            if (Arg(m_hAbout, Text))
+            {
+                if (Text == "anything") Query = WithQueryToken(WithQueryToken(Query, "asset", {}), "op", {});
+                else if (Text.rfind("op:", 0) == 0)    Query = WithQueryToken(WithQueryToken(Query, "asset", {}), "op", Text.substr(3));
+                else if (Text.rfind("asset:", 0) == 0) Query = WithQueryToken(WithQueryToken(Query, "op", {}), "asset", Text.substr(6));
+                else return "LogLens: -About is anything, op:N or asset:X";
+            }
+            if (const filter F = ParseQuery(Query); !F.m_Error.empty()) return std::format("LogLens: invalid query: {}", F.m_Error);
+            std::snprintf(pView->m_Query, sizeof(pView->m_Query), "%s", Query.c_str());
+            return std::format("LogLens: Query={}", Query);
+        }
+        xcmdline::parser::handle m_hOrigin, m_hAbout;
     };
 
     // The Back and Forward buttons as commands: the window (and what the host had in front) returns to where it was, or goes ahead again.
@@ -730,10 +764,10 @@ namespace xlog::commands
         explicit command_set(xundo::system& System, std::function<view_state*()> Window = {}, std::function<bool()> Back = {}, std::function<bool()> Forward = {}
             , std::function<void(const std::string&)> Show = {}) noexcept
             : m_Status(System), m_Operations(System), m_Problems(System), m_Problem(System), m_Events(System), m_Event(System), m_SimulateBuild(System), m_SimulateCompile(System), m_Emit(System)
-            , m_Acknowledge(System, "LogAcknowledge", annotate_cmd::what::Acknowledge), m_Mute(System, "LogMute", annotate_cmd::what::Mute), m_Mark(System), m_Window(System, Window), m_BackCmd(System, std::move(Back), false), m_ForwardCmd(System, std::move(Forward), true), m_Show(System, std::move(Show)), m_Copy(System), m_EventsAction(System, std::move(Window)) {}
+            , m_Acknowledge(System, "LogAcknowledge", annotate_cmd::what::Acknowledge), m_Mute(System, "LogMute", annotate_cmd::what::Mute), m_Mark(System), m_Window(System, Window), m_BackCmd(System, std::move(Back), false), m_ForwardCmd(System, std::move(Forward), true), m_Show(System, std::move(Show)), m_Copy(System), m_Lens(System, Window), m_EventsAction(System, std::move(Window)) {}
         status_cmd m_Status; operations_cmd m_Operations; problems_cmd m_Problems; problem_cmd m_Problem; events_cmd m_Events; event_cmd m_Event;
         simulate_build_cmd m_SimulateBuild; simulate_compile_cmd m_SimulateCompile; emit_cmd m_Emit;
-        annotate_cmd m_Acknowledge, m_Mute; mark_cmd m_Mark; window_cmd m_Window; back_cmd m_BackCmd, m_ForwardCmd; show_cmd m_Show; copy_cmd m_Copy; events_action_cmd m_EventsAction;
+        annotate_cmd m_Acknowledge, m_Mute; mark_cmd m_Mark; window_cmd m_Window; back_cmd m_BackCmd, m_ForwardCmd; show_cmd m_Show; copy_cmd m_Copy; lens_cmd m_Lens; events_action_cmd m_EventsAction;
     };
 }
 

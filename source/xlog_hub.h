@@ -197,6 +197,7 @@ namespace xlog
         bool            m_bHeuristic = false;
         std::uint64_t   m_LastOperation = 0;
         std::string     m_CheckUnit;           // what produced the last occurrence (the translation unit that was compiled)
+        std::string     m_OriginName;          // who produced it (the origin of its first occurrence)
     };
 
     inline constexpr std::size_t problem_retained_v = 3;
@@ -341,7 +342,9 @@ namespace xlog
         severity        m_Min        = severity::Trace;
         std::string     m_Channel;                 // prefix; "game.*" and "game." both mean the prefix
         std::string     m_Code;
-        std::string     m_Origin;                  // origin name
+        std::vector<std::string> m_Origins;        // origin names (origin:a,b): any of them
+        std::string     m_Producer;                // the producer's stable namespace ("vulkan.validation", "msvc.compiler"), exactly
+        std::string     m_Asset;                   // what it is about: the asset's id (hex, 8+ digits) or a part of its name/path
         std::uint64_t   m_Operation  = 0;
         std::vector<std::pair<std::string, bool>> m_Terms;     // every term must match (case-insensitive); true = in the body only. A quoted phrase is ONE term
         std::string     m_NotChannel;
@@ -355,6 +358,14 @@ namespace xlog
             if (Needle.empty()) return true;
             auto It = std::search(Hay.begin(), Hay.end(), Needle.begin(), Needle.end(), [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b)); });
             return It != Hay.end();
+        }
+        // Is the reference about this (asset:Value)? A long hex value is an id, anything else a part of the name or path.
+        inline bool RefMatchesAsset(const ref& R, std::string_view Value) noexcept
+        {
+            if (!R.Valid() || Value.empty()) return false;
+            if (Value.size() >= 8 && Value.size() <= 16 && std::all_of(Value.begin(), Value.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }))
+                if (R.m_Id == std::strtoull(std::string(Value).c_str(), nullptr, 16)) return true;
+            return ContainsNoCase(R.m_Path, Value);
         }
         inline bool Prefix(std::string_view Name, std::string Pattern) noexcept
         {
@@ -385,7 +396,7 @@ namespace xlog
         for (auto& T : Tokens)
         {
             // a key with nothing after it ("channel:", "op:") is a mistake, not "no filter": say so instead of returning everything
-            if (!T.empty() && T.back() == ':' && (Starts(T, "channel:") || Starts(T, "-channel:") || Starts(T, "code:") || Starts(T, "origin:") || Starts(T, "op:") || Starts(T, "body:") || Starts(T, "state:")))
+            if (!T.empty() && T.back() == ':' && (Starts(T, "channel:") || Starts(T, "-channel:") || Starts(T, "code:") || Starts(T, "origin:") || Starts(T, "op:") || Starts(T, "body:") || Starts(T, "state:") || Starts(T, "asset:") || Starts(T, "producer:")))
             { F.m_Error = std::format("'{}' needs a value (channel:, code:, origin:, op:, sev>=, body:)", T); return F; }
             if (Starts(T, "sev>=") || Starts(T, "sev:"))
             {
@@ -395,7 +406,20 @@ namespace xlog
             else if (Starts(T, "channel:")) F.m_Channel = T.substr(8);
             else if (Starts(T, "-channel:")) F.m_NotChannel = T.substr(9);
             else if (Starts(T, "code:"))    F.m_Code = T.substr(5);
-            else if (Starts(T, "origin:"))  F.m_Origin = T.substr(7);
+            else if (Starts(T, "origin:"))
+            {
+                const std::string List = T.substr(7);
+                for (std::size_t At = 0; At <= List.size(); )
+                {
+                    const auto Comma = List.find(',', At);
+                    const std::string Name = List.substr(At, Comma == std::string::npos ? std::string::npos : Comma - At);
+                    if (!Name.empty()) F.m_Origins.push_back(Name);
+                    if (Comma == std::string::npos) break;
+                    At = Comma + 1;
+                }
+            }
+            else if (Starts(T, "asset:"))   F.m_Asset = T.substr(6);
+            else if (Starts(T, "producer:")) F.m_Producer = T.substr(9);
             else if (Starts(T, "op:"))
             {
                 const auto Text = T.substr(3);
@@ -419,7 +443,9 @@ namespace xlog
         if (!F.m_Channel.empty())    Add("channel:" + F.m_Channel);
         if (!F.m_NotChannel.empty()) Add("-channel:" + F.m_NotChannel);
         if (!F.m_Code.empty())       Add("code:" + F.m_Code);
-        if (!F.m_Origin.empty())     Add("origin:" + F.m_Origin);
+        if (!F.m_Origins.empty())    { std::string List; for (const auto& O : F.m_Origins) List += (List.empty() ? "" : ",") + O; Add("origin:" + List); }
+        if (!F.m_Asset.empty())      Add("asset:" + F.m_Asset);
+        if (!F.m_Producer.empty())   Add("producer:" + F.m_Producer);
         if (F.m_Operation)           Add(std::format("op:{}", F.m_Operation));
         for (const auto& [Text, bBody] : F.m_Terms) Add((bBody ? "body:\"" : "\"") + Text + "\"");
         return Out;
@@ -431,7 +457,9 @@ namespace xlog
         if (!F.m_Channel.empty() && !details::Prefix(E.m_Channel, F.m_Channel)) return false;
         if (!F.m_NotChannel.empty() && details::Prefix(E.m_Channel, F.m_NotChannel)) return false;
         if (!F.m_Code.empty() && E.m_Code != F.m_Code) return false;
-        if (!F.m_Origin.empty() && E.m_Origin.m_Name != F.m_Origin) return false;
+        if (!F.m_Origins.empty() && std::find(F.m_Origins.begin(), F.m_Origins.end(), E.m_Origin.m_Name) == F.m_Origins.end()) return false;
+        if (!F.m_Producer.empty() && E.m_Producer != F.m_Producer) return false;
+        if (!F.m_Asset.empty() && !std::any_of(E.m_Subjects.begin(), E.m_Subjects.end(), [&](const ref& R) { return details::RefMatchesAsset(R, F.m_Asset); })) return false;
         if (F.m_Operation && E.m_Operation != F.m_Operation) return false;
         for (const auto& [Text, bBodyOnly] : F.m_Terms)
         {
@@ -551,6 +579,7 @@ namespace xlog
         const operation* FindOperation(std::uint64_t Id) const noexcept { auto It = m_Operations.find(Id); return It == m_Operations.end() ? nullptr : &It->second; }
         const problem*   FindProblem(std::uint64_t Id) const noexcept   { auto It = m_Problems.find(Id);   return It == m_Problems.end() ? nullptr : &It->second; }
         const std::vector<std::uint64_t>& OperationOrder() const noexcept { return m_OperationOrder; }   // ascending id
+        const std::vector<origin>&        Origins() const noexcept        { return m_Origins; }              // every origin that has produced an event, once each (the Source lens lists them)
         const std::vector<std::uint64_t>& ProblemOrder() const noexcept   { return m_ProblemOrder; }     // first seen first
 
         // Bumped by everything a view could show: a committed record, an annotation, a new baseline. A view caches by it.
@@ -656,6 +685,7 @@ namespace xlog
                 m_Segments.back().m_Events.reserve(segment_size_v);
             }
             ++m_Counts[static_cast<int>(E.m_Severity)];
+            if (std::none_of(m_Origins.begin(), m_Origins.end(), [&](const origin& O) { return O.m_Name == E.m_Origin.m_Name && O.m_Type == E.m_Origin.m_Type; })) m_Origins.push_back({ E.m_Origin.m_Type, E.m_Origin.m_Name, 0 });
 
             if (E.m_Operation)
             {
@@ -684,7 +714,7 @@ namespace xlog
             problem& P = It->second;
             if (bNew)
             {
-                P.m_Id = Id; P.m_Producer = E.m_Producer; P.m_Code = E.m_Code; P.m_Title = E.m_Title; P.m_Channel = E.m_Channel;
+                P.m_Id = Id; P.m_Producer = E.m_Producer; P.m_Code = E.m_Code; P.m_Title = E.m_Title; P.m_Channel = E.m_Channel; P.m_OriginName = E.m_Origin.m_Name;
                 P.m_FirstSeq = E.m_Key.m_Sequence; P.m_Site = E.m_Source;
                 if (!E.m_Subjects.empty()) P.m_Subject = E.m_Subjects[0];
                 P.m_Discriminator = E.m_Discriminator; P.m_bHeuristic = E.m_bHeuristic || E.m_Code.empty();
@@ -725,6 +755,7 @@ namespace xlog
         std::size_t                 m_MaxOperations = 5000;
         std::unordered_map<std::uint64_t, problem>   m_Problems;
         std::vector<std::uint64_t>  m_ProblemOrder;
+        std::vector<origin>         m_Origins;
         std::unordered_map<std::uint64_t, annotation> m_Annotations;
         std::uint64_t               m_Baseline = 0;
         std::uint64_t               m_Revision = 1;
@@ -737,6 +768,9 @@ namespace xlog
         if (!F.m_Channel.empty() && !details::Prefix(P.m_Channel, F.m_Channel)) return false;
         if (!F.m_NotChannel.empty() && details::Prefix(P.m_Channel, F.m_NotChannel)) return false;
         if (!F.m_Code.empty() && P.m_Code != F.m_Code) return false;
+        if (!F.m_Origins.empty() && std::find(F.m_Origins.begin(), F.m_Origins.end(), P.m_OriginName) == F.m_Origins.end()) return false;
+        if (!F.m_Producer.empty() && P.m_Producer != F.m_Producer) return false;
+        if (!F.m_Asset.empty() && !details::RefMatchesAsset(P.m_Subject, F.m_Asset)) return false;
         if (F.m_Operation)
         {
             const operation* O = H.FindOperation(F.m_Operation);

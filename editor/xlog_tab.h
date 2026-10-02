@@ -241,6 +241,85 @@ namespace xlog
             if (xeditor::RenderTreeSearchBar(Text, Width, false, Help)) std::snprintf(State.m_Query, sizeof(State.m_Query), "%s", Text.c_str());
         }
 
+        // The two lenses (documentation/Editors/DESIGN_logs.md, 6.5): who produced it (Source: the origins that have spoken, any subset) and what it concerns (About: anything, the
+        // selected row's operation, the selected row's asset). They are not state of their own: each is a token of the query (origin:a,b, op:N, asset:X), which this rewrites, so
+        // the chips, the typed query and the pipe's LogProblems / LogEvents are always the same filter.
+        inline void SetQueryText(view_state& State, const std::string& Query) noexcept { std::snprintf(State.m_Query, sizeof(State.m_Query), "%s", Query.c_str()); }
+
+        inline void LensBar(const hub& Hub, view_state& State) noexcept
+        {
+            // ---- Source
+            std::vector<std::string> Chosen;
+            {
+                const std::string List = QueryValue(State.m_Query, "origin");
+                for (std::size_t At = 0; At <= List.size() && !List.empty(); )
+                {
+                    const auto Comma = List.find(',', At);
+                    Chosen.push_back(List.substr(At, Comma == std::string::npos ? std::string::npos : Comma - At));
+                    if (Comma == std::string::npos) break;
+                    At = Comma + 1;
+                }
+            }
+            const std::string SourceLabel = Chosen.empty() ? "All" : Chosen.size() == 1 ? Chosen[0] : std::format("{} sources", Chosen.size());
+            ImGui::TextDisabled("Source"); ImGui::SameLine();
+            if (ImGui::SmallButton((SourceLabel + " v###sourcelens").c_str())) ImGui::OpenPopup("##sourcepopup");
+            State.m_SourceChipAt[0] = ImGui::GetItemRectMin().x + ImGui::GetItemRectSize().x * 0.5f; State.m_SourceChipAt[1] = ImGui::GetItemRectMin().y + ImGui::GetItemRectSize().y * 0.5f;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Who produced it: any editor, system, script or tool that has said something.");
+            if (ImGui::BeginPopup("##sourcepopup"))
+            {
+                if (ImGui::Selectable("All", Chosen.empty())) SetQueryText(State, WithQueryToken(State.m_Query, "origin", {}));
+                const struct { origin::type m_Type; const char* m_Heading; } Groups[] = { { origin::type::Editor, "Editors" }, { origin::type::System, "Systems" }, { origin::type::Script, "Scripts" }, { origin::type::Tool, "Tools" } };
+                for (const auto& G : Groups)
+                {
+                    bool bAny = false;
+                    for (const auto& O : Hub.Origins())
+                    {
+                        if (O.m_Type != G.m_Type) continue;
+                        if (!bAny) { ImGui::Separator(); ImGui::TextDisabled("%s", G.m_Heading); bAny = true; }
+                        bool bOn = std::find(Chosen.begin(), Chosen.end(), O.m_Name) != Chosen.end();
+                        if (ImGui::Checkbox((O.m_Name + "##src").c_str(), &bOn))
+                        {
+                            std::vector<std::string> Next = Chosen;
+                            if (bOn) Next.push_back(O.m_Name); else Next.erase(std::remove(Next.begin(), Next.end(), O.m_Name), Next.end());
+                            std::string Joined;
+                            for (const auto& N : Next) Joined += (Joined.empty() ? "" : ",") + N;
+                            SetQueryText(State, WithQueryToken(State.m_Query, "origin", Joined));
+                        }
+                    }
+                }
+                ImGui::EndPopup();
+            }
+
+            // ---- About
+            ImGui::SameLine(0, 18.0f);
+            const std::string Operation = QueryValue(State.m_Query, "op"), Asset = QueryValue(State.m_Query, "asset");
+            const std::string AboutLabel = !Operation.empty() ? "operation " + Operation : !Asset.empty() ? "asset " + Asset : "Anything";
+            ImGui::TextDisabled("About"); ImGui::SameLine();
+            if (ImGui::SmallButton((AboutLabel + " v###aboutlens").c_str())) ImGui::OpenPopup("##aboutpopup");
+            State.m_AboutChipAt[0] = ImGui::GetItemRectMin().x + ImGui::GetItemRectSize().x * 0.5f; State.m_AboutChipAt[1] = ImGui::GetItemRectMin().y + ImGui::GetItemRectSize().y * 0.5f;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("What it concerns: anything, or what the selected row is about.");
+            if (ImGui::BeginPopup("##aboutpopup"))
+            {
+                // what the selected row is about: its operation and its first subject
+                std::uint64_t SelOp = 0; ref SelSubject;
+                if (State.m_Page == 0) { if (const problem* P = Hub.FindProblem(State.m_Selected)) { SelOp = P->m_LastOperation; SelSubject = P->m_Subject; } }
+                else if (const event* E = Hub.FindEvent(State.m_SelectedEvent)) { SelOp = E->m_Operation; if (!E->m_Subjects.empty()) SelSubject = E->m_Subjects[0]; }
+
+                if (ImGui::Selectable("Anything", Operation.empty() && Asset.empty())) SetQueryText(State, WithQueryToken(WithQueryToken(State.m_Query, "op", {}), "asset", {}));
+                ImGui::BeginDisabled(SelOp == 0);
+                if (ImGui::Selectable(SelOp ? std::format("This operation (#{})", SelOp).c_str() : "This operation", !Operation.empty()))
+                    SetQueryText(State, WithQueryToken(WithQueryToken(State.m_Query, "asset", {}), "op", std::to_string(SelOp)));
+                ImGui::EndDisabled();
+                ImGui::BeginDisabled(!SelSubject.Valid());
+                const std::string AssetName = SelSubject.m_Path.empty() ? Hex16(SelSubject.m_Id) : SelSubject.m_Path;
+                if (ImGui::Selectable(SelSubject.Valid() ? std::format("This asset ({})", AssetName).c_str() : "This asset", !Asset.empty()))
+                    SetQueryText(State, WithQueryToken(WithQueryToken(State.m_Query, "op", {}), "asset", SelSubject.m_Id ? Hex16(SelSubject.m_Id) : SelSubject.m_Path));
+                ImGui::EndDisabled();
+                if (SelOp == 0 && !SelSubject.Valid()) ImGui::TextDisabled("Select a row to be about what it is about.");
+                ImGui::EndPopup();
+            }
+        }
+
         inline void RenderProblems(hub& Hub, view_state& State, const tab_options& Options) noexcept
         {
             BuildProblemRows(Hub, State, Options.m_ChannelPrefix);
@@ -267,6 +346,7 @@ namespace xlog
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Everything so far stops being New.");
             if (!State.m_QueryError.empty()) { ImGui::PushStyleColor(ImGuiCol_Text, SeverityColor(severity::Error)); ImGui::TextUnformatted(State.m_QueryError.c_str()); ImGui::PopStyleColor(); }
+            LensBar(Hub, State);
 
             const float FooterH = ImGui::GetTextLineHeightWithSpacing() + 4.0f;
             if (ImGui::BeginChild("problems", ImVec2(0, -FooterH), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar))
@@ -407,6 +487,8 @@ namespace xlog
             if (ImGui::SmallButton("Clear view")) { State.m_ViewFrom = Hub.Committed(); State.m_SelectedEvent = State.m_SelFrom = State.m_SelTo = State.m_SelAnchor = 0; State.m_ExpandedEvents.clear(); }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hides what is listed. The events stay in the Logs.");
             if (!State.m_QueryError.empty()) { ImGui::PushStyleColor(ImGuiCol_Text, SeverityColor(severity::Error)); ImGui::TextUnformatted(State.m_QueryError.c_str()); ImGui::PopStyleColor(); }
+
+            LensBar(Hub, State);
 
             const float FooterH = ImGui::GetTextLineHeightWithSpacing() + 4.0f;
             const auto SelectedCount = [&]() -> std::size_t { return State.SelectedEvents().size(); };

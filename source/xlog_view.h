@@ -27,6 +27,66 @@ namespace xlog
         bool            m_bReturnDrawerOpen = false;
     };
 
+    // The query text as tokens, quotes kept as typed, so a token can be replaced without disturbing the rest
+    inline std::vector<std::string> SplitQuery(std::string_view Query) noexcept
+    {
+        std::vector<std::string> Tokens;
+        for (std::size_t i = 0; i < Query.size(); )
+        {
+            while (i < Query.size() && Query[i] == ' ') ++i;
+            if (i >= Query.size()) break;
+            std::string Token;
+            bool bQuoted = false;
+            for (; i < Query.size() && (bQuoted || Query[i] != ' '); ++i) { if (Query[i] == '"') bQuoted = !bQuoted; Token += Query[i]; }
+            Tokens.push_back(std::move(Token));
+        }
+        return Tokens;
+    }
+
+    // The value of the first "Key:" token, or empty
+    inline std::string QueryValue(std::string_view Query, std::string_view Key) noexcept
+    {
+        const std::string Prefix = std::string(Key) + ":";
+        for (const auto& T : SplitQuery(Query)) if (T.rfind(Prefix, 0) == 0) return T.substr(Prefix.size());
+        return {};
+    }
+
+    // The query with its "Key:" tokens replaced by one "Key:Value" (none when Value is empty): what picking a lens does to the text
+    inline std::string WithQueryToken(std::string_view Query, std::string_view Key, std::string_view Value) noexcept
+    {
+        const std::string Prefix = std::string(Key) + ":";
+        std::string Out;
+        for (const auto& T : SplitQuery(Query))
+            if (T.rfind(Prefix, 0) != 0) { if (!Out.empty()) Out += ' '; Out += T; }
+        if (!Value.empty()) { if (!Out.empty()) Out += ' '; Out += Prefix; Out += Value; }
+        return Out;
+    }
+
+    // What the closed drawer's badge says: distinct problems (not occurrences) that still need attention. An acknowledged or muted problem no longer does; a Fatal one is counted
+    // whatever was done to it (it cannot be hidden). New = first seen after the baseline.
+    struct badge_counts
+    {
+        std::size_t m_Errors = 0, m_Warnings = 0, m_Critical = 0, m_New = 0;
+        bool operator==(const badge_counts&) const noexcept = default;
+        bool Any() const noexcept { return m_Errors || m_Warnings || m_Critical; }
+    };
+
+    inline badge_counts CountBadge(const hub& Hub) noexcept
+    {
+        badge_counts C;
+        for (auto Id : Hub.ProblemOrder())
+        {
+            const problem* P = Hub.FindProblem(Id);
+            if (!P) continue;
+            if (P->m_Severity >= severity::Fatal) ++C.m_Critical;
+            const annotation A = Hub.Annotation(P->m_Id);
+            if (A.m_bMuted || A.m_bAcknowledged) continue;
+            if (P->m_Severity >= severity::Error) ++C.m_Errors; else ++C.m_Warnings;
+            if (P->m_FirstSeq > Hub.Baseline()) ++C.m_New;
+        }
+        return C;
+    }
+
     // "00:11.162": the time since the session started, as a clock
     inline std::string ClockText(std::uint64_t Ns) noexcept
     {
@@ -72,6 +132,11 @@ namespace xlog
         std::vector<view_snapshot> m_Forward;               // what Back left: Forward returns to it; any new navigation empties it (as in a browser)
         float           m_BackButton[2]    = { -1.0f, -1.0f };  // where the window last drew the Back / Forward buttons (screen coordinates of their centres; -1 = not drawn):
         float           m_ForwardButton[2] = { -1.0f, -1.0f };  // so a test can click them
+        badge_counts    m_Badge;                            // cached by the hub's revision
+        std::uint64_t   m_BadgeRevision = 0;
+        float           m_BadgeAt[2]       = { -1.0f, -1.0f };  // where the badge was last drawn (a test clicks it); -1 = not drawn
+        float           m_SourceChipAt[2]  = { -1.0f, -1.0f };  // where the two lens chips were last drawn (a test clicks them)
+        float           m_AboutChipAt[2]   = { -1.0f, -1.0f };
         float           m_MouseAt[2]       = { -1.0f, -1.0f };  // where the window last saw the pointer (ImGui's idea of it): a test aims its clicks by the difference
         bool            m_bScrollToSelected = false;        // the selected problem was just opened: bring it to the top so its details are in view
         std::vector<std::uint64_t> m_Expanded;              // problems whose details are open inline
