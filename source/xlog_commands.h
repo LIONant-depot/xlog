@@ -88,14 +88,6 @@ namespace xlog::commands
             return true;
         }
 
-        // The query text: -Query as typed, or -Query64 in base64 (a phrase in quotes cannot go through the command line itself).
-        bool QueryText(xcmdline::parser::handle Plain, xcmdline::parser::handle Encoded, std::string& Out) noexcept
-        {
-            std::string Text;
-            if (Arg(Encoded, Text)) { Out = Base64Decode(Text); return true; }
-            return Arg(Plain, Out);
-        }
-
         // The barrier: everything any thread has pushed so far is committed before the answer is built.
         void Settle(hub& H) noexcept { for (int i = 0; i < 64 && H.Drain(1u << 16) > 0; ++i) {} }
 
@@ -216,7 +208,6 @@ namespace xlog::commands
         void RegisterArguments() noexcept override
         {
             m_hQuery = m_Parser.addOption("Query", "sev>=error channel:game.* code:C2065 op:42 text ...", false, 1);
-            m_hQuery64 = m_Parser.addOption("Query64", "The same, in base64 (for text with quotes or spaces)", false, 1);
             m_hMin = m_Parser.addOption("MinSeverity", "Warning, Error or Fatal (Error includes Fatal)", false, 1);
             m_hOperation = m_Parser.addOption("Operation", "Only problems that occurred inside this operation", false, 1);
             m_hLimit = m_Parser.addOption("Limit", "Rows, default 50", false, 1);
@@ -231,7 +222,7 @@ namespace xlog::commands
             hub& H = *pHub;
             Settle(H);
             std::string QueryString, Text; severity Min = severity::Trace; std::uint64_t Limit = 50, Operation = 0, After = 0;
-            QueryText(m_hQuery, m_hQuery64, QueryString);
+            Arg(m_hQuery, QueryString);
             if (Arg(m_hMin, Text) && !ParseSeverity(Text, Min)) return std::format("LogProblems: unknown severity '{}'", Text);
             if (Arg(m_hOperation, Text) && !ParseNumber(Text, Operation)) return "LogProblems: -Operation is not a number";
             if (Arg(m_hLimit, Text) && !ParseNumber(Text, Limit)) return "LogProblems: -Limit is not a number";
@@ -271,7 +262,7 @@ namespace xlog::commands
             Out += std::format("Evidence=full  Gaps=none  Excluded=none  Dropped=0\n");
             return Out + "\n" + Rows;
         }
-        xcmdline::parser::handle m_hQuery, m_hQuery64, m_hMin, m_hOperation, m_hLimit, m_hAfter, m_hState, m_hMuted;
+        xcmdline::parser::handle m_hQuery, m_hMin, m_hOperation, m_hLimit, m_hAfter, m_hState, m_hMuted;
     };
 
     //==================================================================================================================
@@ -320,7 +311,6 @@ namespace xlog::commands
         void RegisterArguments() noexcept override
         {
             m_hQuery = m_Parser.addOption("Query", "sev>=error channel:game.* code:C2065 op:42 origin:msbuild body:text text ...", false, 1);
-            m_hQuery64 = m_Parser.addOption("Query64", "The same, in base64 (for text with quotes or spaces)", false, 1);
             m_hMin = m_Parser.addOption("MinSeverity", "Trace, Debug, Info, Warning, Error or Fatal", false, 1);
             m_hOperation = m_Parser.addOption("Operation", "Only events inside this operation", false, 1);
             m_hLimit = m_Parser.addOption("Limit", "Rows, default 50", false, 1);
@@ -333,7 +323,7 @@ namespace xlog::commands
             hub& H = *pHub;
             Settle(H);
             std::string QueryString, Text; severity Min = severity::Trace; std::uint64_t Limit = 50, Operation = 0, After = 0, UpTo = H.Committed();
-            QueryText(m_hQuery, m_hQuery64, QueryString);
+            Arg(m_hQuery, QueryString);
             if (Arg(m_hMin, Text) && !ParseSeverity(Text, Min)) return std::format("LogEvents: unknown severity '{}'", Text);
             if (Arg(m_hOperation, Text) && !ParseNumber(Text, Operation)) return "LogEvents: -Operation is not a number";
             if (Arg(m_hLimit, Text) && !ParseNumber(Text, Limit)) return "LogEvents: -Limit is not a number";
@@ -369,7 +359,7 @@ namespace xlog::commands
             Out += std::format("Evidence={}  Gaps={}  Excluded=none  Dropped=0  Expired={}\n", S.m_Expired ? "partial" : "full", S.m_Expired ? "expired-before-retained" : "none", S.m_Expired);
             return Out + "\n" + Rows;
         }
-        xcmdline::parser::handle m_hQuery, m_hQuery64, m_hMin, m_hOperation, m_hLimit, m_hAfter;
+        xcmdline::parser::handle m_hQuery, m_hMin, m_hOperation, m_hLimit, m_hAfter;
     };
 
     struct event_cmd : log_query
@@ -663,7 +653,6 @@ namespace xlog::commands
             m_hName = m_Parser.addOption("Name", "The view's name", true, 1);
             if (m_bDelete) return;
             m_hQuery = m_Parser.addOption("Query", "The query bar's text", false, 1);
-            m_hQuery64 = m_Parser.addOption("Query64", "The query in base64", false, 1);
             m_hPage = m_Parser.addOption("Page", "Problems or Events", false, 1);
             m_hState = m_Parser.addOption("State", "New, Active or All", false, 1);
             m_hMuted = m_Parser.addOption("ShowMuted", "true to list muted problems", false, 1);
@@ -687,7 +676,7 @@ namespace xlog::commands
             std::string Text;
             view_state* pState = m_Get ? m_Get() : nullptr;
             saved_view V = pState ? pState->ToSaved(Name, false) : saved_view{ Name };
-            if (QueryArg(Text)) V.m_Query = Text;
+            if (Arg(m_hQuery, Text)) V.m_Query = Text;
             if (Arg(m_hPage, Text)) { if (Text != "Problems" && Text != "Events") return "LogViewSave: -Page is Problems or Events"; V.m_Page = Text == "Events"; }
             if (Arg(m_hState, Text)) { problem_view PV; if (!ParseProblemView(Text, PV)) return "LogViewSave: -State is New, Active or All"; V.m_State = static_cast<std::uint8_t>(PV); }
             if (Arg(m_hMuted, Text)) V.m_bShowMuted = Text == "true";
@@ -695,12 +684,6 @@ namespace xlog::commands
             if (const filter F = ParseQuery(V.m_Query); !F.m_Error.empty()) return std::format("LogViewSave: invalid query: {}", F.m_Error);
             pHub->SaveView(std::move(V));
             return {};
-        }
-        bool QueryArg(std::string& Out) noexcept
-        {
-            std::string Text;
-            if (Arg(m_hQuery64, Text)) { Out = Base64Decode(Text); return true; }
-            return Arg(m_hQuery, Out);
         }
         static void WriteText(xundo::undo_file& File, const std::string& S) noexcept { const std::uint32_t N = static_cast<std::uint32_t>(S.size()); File.Write(N); for (char c : S) File.Write(c); }
         static std::string ReadText(xundo::undo_file& File) noexcept { std::uint32_t N = 0; File.Read(N); std::string S(N, ' '); for (auto& c : S) File.Read(c); return S; }
@@ -729,7 +712,7 @@ namespace xlog::commands
             }
             if (auto* pHub = hub::current()) { if (Had) pHub->SaveView(std::move(V)); else pHub->DeleteView(V.m_Name); }
         }
-        xcmdline::parser::handle m_hName, m_hQuery, m_hQuery64, m_hPage, m_hState, m_hMuted, m_hTeam;
+        xcmdline::parser::handle m_hName, m_hQuery, m_hPage, m_hState, m_hMuted, m_hTeam;
     };
 
     // What an asset depends on, as the editor's provider answers (the About lens "and what it depends on" selects events and problems about any of these too).
@@ -787,11 +770,10 @@ namespace xlog::commands
     struct attach_cmd : log_query
     {
         attach_cmd(xundo::system& System) noexcept : log_query(System, "LogAttach") { RegisterArguments(); }
-        const char* getCommandHelp() const noexcept override { return "Copies a file into the launch's Logs folder and attaches it to an event or an operation (max 8 MB each, 64 MB a launch). Usage: LogAttach (-Path file | -Path64 base64-of-file) (-Event seq | -Operation id) [-Name n]"; }
+        const char* getCommandHelp() const noexcept override { return "Copies a file into the launch's Logs folder and attaches it to an event or an operation (max 8 MB each, 64 MB a launch). Usage: LogAttach (-Path file | -Path64 text-of-file) (-Event seq | -Operation id) [-Name n]"; }
         void RegisterArguments() noexcept override
         {
-            m_hPath = m_Parser.addOption("Path", "The file to keep", false, 1);
-            m_hPath64 = m_Parser.addOption("Path64", "The file to keep, in base64 (a path with a backslash cannot go through the command line as it is)", false, 1);
+            m_hPath = m_Parser.addOption("Path", "The file to keep", true, 1);
             m_hEvent = m_Parser.addOption("Event", "The event sequence it belongs to", false, 1);
             m_hOperation = m_Parser.addOption("Operation", "The operation id it belongs to", false, 1);
             m_hName = m_Parser.addOption("Name", "What to call it (default: the file's name)", false, 1);
@@ -802,7 +784,7 @@ namespace xlog::commands
             if (!pHub) return "LogAttach: no host";
             Settle(*pHub);
             std::string Path, Text, Name; std::uint64_t Event = 0, Operation = 0;
-            if (Arg(m_hPath64, Path)) Path = Base64Decode(Path); else if (!Arg(m_hPath, Path)) return "LogAttach: -Path or -Path64 is required";
+            if (!Arg(m_hPath, Path)) return "LogAttach: -Path is required";
             if (Arg(m_hEvent, Text) && !ParseNumber(Text, Event)) return "LogAttach: -Event is not a sequence";
             if (Arg(m_hOperation, Text) && !ParseNumber(Text, Operation)) return "LogAttach: -Operation is not an id";
             Arg(m_hName, Name);
@@ -811,7 +793,7 @@ namespace xlog::commands
             const auto& A = pHub->Attachments().back();
             return std::format("LogAttach: attached {}  Id={}  Bytes={}  Path={}", A.m_Name, A.m_Id, A.m_Bytes, A.m_Path);
         }
-        xcmdline::parser::handle m_hPath, m_hPath64, m_hEvent, m_hOperation, m_hName;
+        xcmdline::parser::handle m_hPath, m_hEvent, m_hOperation, m_hName;
     };
 
     struct attachments_cmd : log_query
@@ -869,17 +851,16 @@ namespace xlog::commands
     struct simulate_stdout_cmd : log_query
     {
         simulate_stdout_cmd(xundo::system& System) noexcept : log_query(System, "LogSimulateStdout") { RegisterArguments(); }
-        const char* getCommandHelp() const noexcept override { return "Prints a line to the process' stdout or stderr, as legacy code would (for tests). Usage: LogSimulateStdout -Text base64 [-Stderr true]"; }
+        const char* getCommandHelp() const noexcept override { return "Prints a line to the process' stdout or stderr, as legacy code would (for tests). Usage: LogSimulateStdout -Text text [-Stderr true]"; }
         void RegisterArguments() noexcept override
         {
-            m_hText = m_Parser.addOption("Text", "The line, base64", true, 1);
+            m_hText = m_Parser.addOption("Text", "The line", true, 1);
             m_hStderr = m_Parser.addOption("Stderr", "true: to stderr", false, 1);
         }
         std::string Query() noexcept override
         {
             std::string Text, Flag;
             if (!Arg(m_hText, Text)) return "LogSimulateStdout: -Text is required";
-            Text = Base64Decode(Text);
             if (Arg(m_hStderr, Flag) && Flag == "true") std::fprintf(stderr, "%s\n", Text.c_str()); else std::printf("%s\n", Text.c_str());
             std::fflush(stdout); std::fflush(stderr);
             return "LogSimulateStdout: printed";
@@ -1119,10 +1100,10 @@ namespace xlog::commands
     struct simulate_build_cmd : log_query
     {
         simulate_build_cmd(xundo::system& System) noexcept : log_query(System, "LogSimulateBuild") { RegisterArguments(); }
-        const char* getCommandHelp() const noexcept override { return "Diagnostic: runs compiler output through the build adapter as a game.build operation. Usage: LogSimulateBuild -Text base64 [-Exit n] [-Subject name] [-Target t] [-Coverage unknown|subjects|complete]"; }
+        const char* getCommandHelp() const noexcept override { return "Diagnostic: runs compiler output through the build adapter as a game.build operation. Usage: LogSimulateBuild -Text text [-Exit n] [-Subject name] [-Target t] [-Coverage unknown|subjects|complete]"; }
         void RegisterArguments() noexcept override
         {
-            m_hText = m_Parser.addOption("Text", "The output, base64", true, 1);
+            m_hText = m_Parser.addOption("Text", "The output", true, 1);
             m_hExit = m_Parser.addOption("Exit", "The exit code, default 0", false, 1);
             m_hSubject = m_Parser.addOption("Subject", "What was built, default Game.dll (simulated)", false, 1);
             m_hTarget = m_Parser.addOption("Target", "The verification target, default Game.dll|simulated: only a success with the same target speaks of earlier problems", false, 1);
@@ -1141,15 +1122,14 @@ namespace xlog::commands
             std::string Target = "Game.dll|simulated", Cover = "subjects";
             Arg(m_hTarget, Target); Arg(m_hCoverage, Cover);
             if (Cover != "unknown" && Cover != "subjects" && Cover != "complete") return "LogSimulateBuild: -Coverage is unknown, subjects or complete";
-            const std::string Output = Base64Decode(Text);
             auto Op = pHub->Begin("game.build", { origin::type::Tool, "msbuild", 0 }, { ref::type::File, Subject, 0, 0, 0, 0 }, "Build Game.dll", Target);
             const auto Id = Op.Id();
             {
                 build_output_adapter Adapter(*pHub, Op);
-                for (std::size_t Start = 0; Start <= Output.size(); )
+                for (std::size_t Start = 0; Start <= Text.size(); )
                 {
-                    const auto Eol = Output.find('\n', Start);
-                    Adapter.Feed(std::string_view(Output).substr(Start, Eol == std::string::npos ? Output.size() - Start : Eol - Start));
+                    const auto Eol = Text.find('\n', Start);
+                    Adapter.Feed(std::string_view(Text).substr(Start, Eol == std::string::npos ? Text.size() - Start : Eol - Start));
                     if (Eol == std::string::npos) break;
                     Start = Eol + 1;
                 }
@@ -1165,10 +1145,10 @@ namespace xlog::commands
     struct simulate_compile_cmd : log_query
     {
         simulate_compile_cmd(xundo::system& System) noexcept : log_query(System, "LogSimulateCompile") { RegisterArguments(); }
-        const char* getCommandHelp() const noexcept override { return "Diagnostic: runs a resource compiler's output through the pipeline adapter as an asset.compile operation about one asset. Usage: LogSimulateCompile -Text base64 -Asset id [-Exit n] [-Name n] [-Type texture]"; }
+        const char* getCommandHelp() const noexcept override { return "Diagnostic: runs a resource compiler's output through the pipeline adapter as an asset.compile operation about one asset. Usage: LogSimulateCompile -Text text -Asset id [-Exit n] [-Name n] [-Type texture]"; }
         void RegisterArguments() noexcept override
         {
-            m_hText = m_Parser.addOption("Text", "The compiler's output, base64", true, 1);
+            m_hText = m_Parser.addOption("Text", "The compiler's output", true, 1);
             m_hAsset = m_Parser.addOption("Asset", "The asset's instance id (any number): the operation's subject", true, 1);
             m_hExit = m_Parser.addOption("Exit", "0 (default) = succeeded, otherwise failed", false, 1);
             m_hName = m_Parser.addOption("Name", "The asset's name", false, 1);
@@ -1190,7 +1170,7 @@ namespace xlog::commands
             const auto Id = Op.Id();
             {
                 pipeline_output_adapter Adapter(*pHub, Op, Subject, "asset.compile." + Type);
-                FeedPipelineOutput(Adapter, Base64Decode(Text));
+                FeedPipelineOutput(Adapter, Text);
             }
             Exit == 0 ? Op.Succeed() : Op.Fail();
             return std::format("LogSimulateCompile: operation {}", Id);
@@ -1201,10 +1181,10 @@ namespace xlog::commands
     struct emit_cmd : log_query
     {
         emit_cmd(xundo::system& System) noexcept : log_query(System, "LogEmit") { RegisterArguments(); }
-        const char* getCommandHelp() const noexcept override { return "Diagnostic: records an event (origin tool:pipe). Usage: LogEmit -Text base64 [-Severity s] [-Channel c] [-Code x] [-Kind log|diagnostic] [-Count n]"; }
+        const char* getCommandHelp() const noexcept override { return "Diagnostic: records an event (origin tool:pipe). Usage: LogEmit -Text text [-Severity s] [-Channel c] [-Code x] [-Kind log|diagnostic] [-Count n]"; }
         void RegisterArguments() noexcept override
         {
-            m_hText = m_Parser.addOption("Text", "First line is the title, the rest the body; base64", true, 1);
+            m_hText = m_Parser.addOption("Text", "First line is the title, the rest the body", true, 1);
             m_hSeverity = m_Parser.addOption("Severity", "Default info", false, 1);
             m_hChannel = m_Parser.addOption("Channel", "Default editor.pipe", false, 1);
             m_hCode = m_Parser.addOption("Code", "A stable code", false, 1);
@@ -1221,13 +1201,12 @@ namespace xlog::commands
             Arg(m_hChannel, Channel); Arg(m_hCode, Code);
             const bool bDiagnostic = Arg(m_hKind, KindText) && KindText == "diagnostic";
             if (Arg(m_hCount, CountText) && !ParseNumber(CountText, Count)) return "LogEmit: -Count is not a number";
-            const std::string Decoded = Base64Decode(Text);
             for (std::uint64_t i = 0; i < Count; ++i)
             {
                 event E;
                 E.m_Producer = "xlion.pipe"; E.m_Origin = { origin::type::Tool, "pipe", 0 }; E.m_Severity = Sev; E.m_Kind = bDiagnostic ? kind::Diagnostic : kind::Log;
                 E.m_Channel = Channel; E.m_Code = Code;
-                SetMessage(E, Decoded);
+                SetMessage(E, Text);
                 pHub->Emit(std::move(E));
             }
             return std::format("LogEmit: {} recorded", Count);

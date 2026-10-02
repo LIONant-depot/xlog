@@ -306,21 +306,6 @@ namespace xlog
 
     inline std::string Hex16(std::uint64_t V) noexcept { return std::format("{:016X}", V); }
 
-    inline std::string Base64Decode(const std::string& In) noexcept
-    {
-        std::string Out;
-        std::uint32_t Acc = 0; int Bits = 0;
-        for (unsigned char c : In)
-        {
-            int V;
-            if (c >= 'A' && c <= 'Z') V = c - 'A'; else if (c >= 'a' && c <= 'z') V = c - 'a' + 26; else if (c >= '0' && c <= '9') V = c - '0' + 52;
-            else if (c == '+') V = 62; else if (c == '/') V = 63; else continue;
-            Acc = (Acc << 6) | static_cast<std::uint32_t>(V); Bits += 6;
-            if (Bits >= 8) { Bits -= 8; Out += static_cast<char>((Acc >> Bits) & 0xFF); }
-        }
-        return Out;
-    }
-
     //------------------------------------------------------------------------------------------------------------------
     // The pending records (what travels through the ring)
     //------------------------------------------------------------------------------------------------------------------
