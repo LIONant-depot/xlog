@@ -180,6 +180,7 @@ namespace xlog
         std::vector<std::string> m_Units;      // the units a build really compiled (for Subjects coverage)
         bool            m_bEvidenceReady = false;   // ended AND every record of it is in the store
         std::uint32_t   m_Events = 0, m_Errors = 0, m_Warnings = 0;
+        std::uint64_t   m_FirstSeq = 0, m_LastSeq = 0;      // the span of sequences its events live in (other operations' events may be interleaved): a view reads them without scanning the store
         std::vector<std::uint64_t> m_Problems; // unique problem ids that occurred inside it
     };
 
@@ -199,6 +200,28 @@ namespace xlog
     };
 
     inline constexpr std::size_t problem_retained_v = 3;
+
+    // What the person decided about a problem (design 5.2: triage and suppression are independent of what the producers say). Presentation only:
+    // collection continues and the original severity stays.
+    struct annotation { bool m_bAcknowledged = false; bool m_bMuted = false; };
+
+    // The presets of the Problems list. New = first seen after the baseline; Active = not acknowledged; All = everything not muted.
+    enum class problem_view : std::uint8_t { New, Active, All };
+    inline constexpr const char* ProblemViewName(problem_view V) noexcept
+    {
+        constexpr const char* Names[] = { "New", "Active", "All" };
+        return Names[static_cast<int>(V)];
+    }
+    inline bool ParseProblemView(std::string_view Text, problem_view& Out) noexcept
+    {
+        for (int i = 0; i < 3; ++i)
+        {
+            const std::string_view Name = ProblemViewName(static_cast<problem_view>(i));
+            if (Text.size() == Name.size() && std::equal(Text.begin(), Text.end(), Name.begin(), [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b)); }))
+            { Out = static_cast<problem_view>(i); return true; }
+        }
+        return false;
+    }
 
     //------------------------------------------------------------------------------------------------------------------
     // Identity of a problem: producer namespace + code + site + subject + discriminator. Never a timestamp, an address, a session or the rendered text.
@@ -530,6 +553,32 @@ namespace xlog
         const std::vector<std::uint64_t>& OperationOrder() const noexcept { return m_OperationOrder; }   // ascending id
         const std::vector<std::uint64_t>& ProblemOrder() const noexcept   { return m_ProblemOrder; }     // first seen first
 
+        // Bumped by everything a view could show: a committed record, an annotation, a new baseline. A view caches by it.
+        std::uint64_t Revision() const noexcept { return m_Revision; }
+
+        // ---- the person's decisions (host thread) ------------------------------------------------------------------
+        annotation Annotation(std::uint64_t ProblemId) const noexcept { auto It = m_Annotations.find(ProblemId); return It == m_Annotations.end() ? annotation{} : It->second; }
+        void SetAcknowledged(std::uint64_t ProblemId, bool b) noexcept { Annotate(ProblemId).m_bAcknowledged = b; ++m_Revision; }
+        void SetMuted(std::uint64_t ProblemId, bool b) noexcept        { Annotate(ProblemId).m_bMuted = b; ++m_Revision; }
+        std::size_t MutedCount() const noexcept { std::size_t N = 0; for (const auto& [Id, A] : m_Annotations) if (A.m_bMuted && m_Problems.contains(Id)) ++N; return N; }
+
+        // "New" means first seen after the baseline; by default that is the start of this launch (everything). Moving it is "I have seen these".
+        std::uint64_t Baseline() const noexcept { return m_Baseline; }
+        void SetBaseline(std::uint64_t Sequence) noexcept { m_Baseline = Sequence; ++m_Revision; }
+
+        // A muted problem is not listed unless asked for; a Fatal one can never be hidden.
+        bool InView(const problem& P, problem_view V, bool bShowMuted = false) const noexcept
+        {
+            const annotation A = Annotation(P.m_Id);
+            if (A.m_bMuted && !bShowMuted && P.m_Severity < severity::Fatal) return false;
+            switch (V)
+            {
+            case problem_view::New:    return P.m_FirstSeq > m_Baseline;
+            case problem_view::Active: return !A.m_bAcknowledged;
+            default:                   return true;
+            }
+        }
+
         status Status() const noexcept
         {
             status S;
@@ -557,8 +606,11 @@ namespace xlog
             m_Ring.push_back(std::move(R));
         }
 
+        annotation& Annotate(std::uint64_t ProblemId) noexcept { return m_Annotations[ProblemId]; }
+
         void Commit(record&& R) noexcept
         {
+            ++m_Revision;
             if (auto* pE = std::get_if<event>(&R))            CommitEvent(std::move(*pE));
             else if (auto* pB = std::get_if<op_begin>(&R))    CommitBegin(std::move(*pB));
             else if (auto* pU = std::get_if<op_unit>(&R))     { if (auto It = m_Operations.find(pU->m_Id); It != m_Operations.end() && It->second.m_Units.size() < 4096) It->second.m_Units.push_back(std::move(pU->m_Unit)); }
@@ -610,6 +662,8 @@ namespace xlog
                 if (auto It = m_Operations.find(E.m_Operation); It != m_Operations.end())
                 {
                     ++It->second.m_Events;
+                    if (!It->second.m_FirstSeq) It->second.m_FirstSeq = E.m_Key.m_Sequence;
+                    It->second.m_LastSeq = E.m_Key.m_Sequence;
                     if (E.m_Severity >= severity::Error)        ++It->second.m_Errors;
                     else if (E.m_Severity == severity::Warning) ++It->second.m_Warnings;
                 }
@@ -671,7 +725,31 @@ namespace xlog
         std::size_t                 m_MaxOperations = 5000;
         std::unordered_map<std::uint64_t, problem>   m_Problems;
         std::vector<std::uint64_t>  m_ProblemOrder;
+        std::unordered_map<std::uint64_t, annotation> m_Annotations;
+        std::uint64_t               m_Baseline = 0;
+        std::uint64_t               m_Revision = 1;
     };
+
+    // Does the problem match the query? The one rule for the pipe's LogProblems and for the window's list, so both show the same rows.
+    inline bool ProblemMatches(const hub& H, const problem& P, const filter& F, severity Min = severity::Trace) noexcept
+    {
+        if (P.m_Severity < Min || P.m_Severity < F.m_Min) return false;
+        if (!F.m_Channel.empty() && !details::Prefix(P.m_Channel, F.m_Channel)) return false;
+        if (!F.m_NotChannel.empty() && details::Prefix(P.m_Channel, F.m_NotChannel)) return false;
+        if (!F.m_Code.empty() && P.m_Code != F.m_Code) return false;
+        if (F.m_Operation)
+        {
+            const operation* O = H.FindOperation(F.m_Operation);
+            if (!O || std::find(O->m_Problems.begin(), O->m_Problems.end(), P.m_Id) == O->m_Problems.end()) return false;
+        }
+        for (const auto& [Text, bBodyOnly] : F.m_Terms)
+        {
+            if (bBodyOnly) return false;           // a problem has no body of its own: its occurrences do (search them in Events)
+            if (!details::ContainsNoCase(P.m_Title, Text) && !details::ContainsNoCase(P.m_Site.m_Path, Text) && !details::ContainsNoCase(P.m_Subject.m_Path, Text)
+             && !details::ContainsNoCase(P.m_Discriminator, Text) && !details::ContainsNoCase(P.m_Code, Text)) return false;
+        }
+        return true;
+    }
 
     inline void op_handle::Unit(std::string Name) noexcept { if (m_pHub && !m_bEnded) m_pHub->PushOperationRecord(record{ op_unit{ m_Id, std::move(Name) } }); }
     inline void op_handle::SetCoverage(coverage_kind C) noexcept { if (m_pHub && !m_bEnded) m_pHub->PushOperationRecord(record{ op_coverage{ m_Id, C } }); }

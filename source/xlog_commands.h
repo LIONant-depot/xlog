@@ -10,9 +10,12 @@
 // (\n, \t). A reply is capped; a truncated one says so and gives the cursor to continue from.
 #include "xlog_hub.h"
 #include "xlog_build.h"
+#include "xlog_pipeline.h"
+#include "xlog_view.h"
 #include "dependencies/xundo/source/xundo_system.h"
 
 #include <charconv>
+#include <functional>
 #include <cstdlib>
 
 namespace xlog::commands
@@ -190,29 +193,10 @@ namespace xlog::commands
     };
 
     //==================================================================================================================
-    inline bool ProblemMatches(hub& H, const problem& P, const filter& F, severity Min) noexcept
-    {
-        if (P.m_Severity < Min || P.m_Severity < F.m_Min) return false;
-        if (!F.m_Channel.empty() && !details::Prefix(P.m_Channel, F.m_Channel)) return false;
-        if (!F.m_NotChannel.empty() && details::Prefix(P.m_Channel, F.m_NotChannel)) return false;
-        if (!F.m_Code.empty() && P.m_Code != F.m_Code) return false;
-        if (F.m_Operation)
-        {
-            const operation* O = H.FindOperation(F.m_Operation);
-            if (!O || std::find(O->m_Problems.begin(), O->m_Problems.end(), P.m_Id) == O->m_Problems.end()) return false;
-        }
-        for (const auto& [Text, bBodyOnly] : F.m_Terms)
-        {
-            if (bBodyOnly) return false;           // a problem has no body of its own: its occurrences do (search them in Events)
-            if (!details::ContainsNoCase(P.m_Title, Text) && !details::ContainsNoCase(P.m_Site.m_Path, Text) && !details::ContainsNoCase(P.m_Discriminator, Text) && !details::ContainsNoCase(P.m_Code, Text)) return false;
-        }
-        return true;
-    }
-
     struct problems_cmd : log_query
     {
         problems_cmd(xundo::system& System) noexcept : log_query(System, "LogProblems") { RegisterArguments(); }
-        const char* getCommandHelp() const noexcept override { return "Problems: one row per diagnostic identity, in first-seen order. Usage: LogProblems [-Query q] [-MinSeverity Warning|Error|Fatal] [-Operation id] [-Limit n] [-After cursor]"; }
+        const char* getCommandHelp() const noexcept override { return "Problems: one row per diagnostic identity, in first-seen order. Usage: LogProblems [-Query q] [-State New|Active|All] [-IncludeMuted true] [-MinSeverity Warning|Error|Fatal] [-Operation id] [-Limit n] [-After cursor]. Without -State every problem is listed, muted ones too (Suppression says which); with it the rows are the window's list."; }
         void RegisterArguments() noexcept override
         {
             m_hQuery = m_Parser.addOption("Query", "sev>=error channel:game.* code:C2065 op:42 text ...", false, 1);
@@ -221,6 +205,8 @@ namespace xlog::commands
             m_hOperation = m_Parser.addOption("Operation", "Only problems that occurred inside this operation", false, 1);
             m_hLimit = m_Parser.addOption("Limit", "Rows, default 50", false, 1);
             m_hAfter = m_Parser.addOption("After", "The cursor of the previous page", false, 1);
+            m_hState = m_Parser.addOption("State", "The window's presets: New (first seen after the baseline), Active (not acknowledged), All; muted problems are left out", false, 1);
+            m_hMuted = m_Parser.addOption("IncludeMuted", "true: list the muted problems too (with -State)", false, 1);
         }
         std::string Query() noexcept override
         {
@@ -238,23 +224,28 @@ namespace xlog::commands
                 const auto Colon = Text.find(':');
                 if (!ParseNumber(std::string_view(Text).substr(Colon == std::string::npos ? 0 : Colon + 1), After)) return "LogProblems: -After is not a cursor";
             }
+            problem_view View = problem_view::All; bool bState = false, bMuted = false;
+            if (Arg(m_hState, Text)) { if (!ParseProblemView(Text, View)) return std::format("LogProblems: unknown state '{}' (New, Active, All)", Text); bState = true; }
+            if (Arg(m_hMuted, Text)) bMuted = Text == "true";
             filter F = ParseQuery(QueryString);
             if (!F.m_Error.empty()) return std::format("LogProblems: invalid query: {}", F.m_Error);
             if (Operation) F.m_Operation = Operation;
 
-            std::string Rows = "Id\tSeverity\tCode\tOccurrences\tFirstSeq\tLastSeq\tSite\tSubject\tHeuristic\tUnit\tTitle\n";
+            std::string Rows = "Id\tSeverity\tCode\tOccurrences\tFirstSeq\tLastSeq\tSite\tSubject\tHeuristic\tUnit\tTitle\tTriage\tSuppression\n";
             std::size_t Matched = 0, Returned = 0, Occurrences = 0, Index = 0, LastIndex = 0; bool bTruncated = false;
             for (auto Id : H.ProblemOrder())
             {
                 ++Index;
                 const problem* P = H.FindProblem(Id);
-                if (!P || !ProblemMatches(H, *P, F, Min)) continue;
+                if (!P || !ProblemMatches(H, *P, F, Min) || (bState && !H.InView(*P, View, bMuted))) continue;
                 ++Matched; Occurrences += P->m_Count;
                 if (Index <= After) continue;
                 if (Returned >= Limit || Rows.size() > reply_cap_v) { bTruncated = true; continue; }
                 const std::string Site = P->m_Site.m_Type == ref::type::File ? (P->m_Site.m_Line > 0 ? std::format("{}:{}", P->m_Site.m_Path, P->m_Site.m_Line) : P->m_Site.m_Path) : std::string{};
-                Rows += std::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", Hex16(P->m_Id), SeverityName(P->m_Severity), Escape(P->m_Code), P->m_Count, P->m_FirstSeq, P->m_LastSeq
-                    , Escape(Site), Escape(P->m_Subject.m_Path.empty() ? P->m_Discriminator : P->m_Subject.m_Path), P->m_bHeuristic ? "true" : "false", Escape(P->m_CheckUnit), Escape(P->m_Title));
+                const annotation A = H.Annotation(P->m_Id);
+                Rows += std::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", Hex16(P->m_Id), SeverityName(P->m_Severity), Escape(P->m_Code), P->m_Count, P->m_FirstSeq, P->m_LastSeq
+                    , Escape(Site), Escape(P->m_Subject.m_Path.empty() ? P->m_Discriminator : P->m_Subject.m_Path), P->m_bHeuristic ? "true" : "false", Escape(P->m_CheckUnit), Escape(P->m_Title)
+                    , A.m_bAcknowledged ? "Acknowledged" : "Unreviewed", A.m_bMuted ? "Muted" : "None");
                 ++Returned; LastIndex = Index;
             }
             std::string Out = Header("LogProblems", H);
@@ -263,7 +254,7 @@ namespace xlog::commands
             Out += std::format("Evidence=full  Gaps=none  Excluded=none  Dropped=0\n");
             return Out + "\n" + Rows;
         }
-        xcmdline::parser::handle m_hQuery, m_hQuery64, m_hMin, m_hOperation, m_hLimit, m_hAfter;
+        xcmdline::parser::handle m_hQuery, m_hQuery64, m_hMin, m_hOperation, m_hLimit, m_hAfter, m_hState, m_hMuted;
     };
 
     //==================================================================================================================
@@ -289,8 +280,9 @@ namespace xlog::commands
             Out += std::format("Occurrences={}  FirstSeq={}  LastSeq={}  Heuristic={}  Discriminator={}\n", P->m_Count, P->m_FirstSeq, P->m_LastSeq, P->m_bHeuristic ? "true" : "false", Escape(P->m_Discriminator));
             if (P->m_Site.m_Type == ref::type::File) Out += std::format("Site={}:{}:{}\n", P->m_Site.m_Path, P->m_Site.m_Line, P->m_Site.m_Column);
             Out += std::format("LastOperation={}  CheckUnit={}\n", P->m_LastOperation, Escape(P->m_CheckUnit));
-            // The four dimensions of the lifecycle; P0 knows only the first value of each (annotations and verification arrive later).
-            Out += "Triage=Unreviewed  Verification=Unverified  Suppression=None  RunPresence=Observed\n";
+            // The four dimensions of the lifecycle: triage and suppression are the person's (acknowledge, mute); verification arrives with P2.
+            const annotation A = H.Annotation(P->m_Id);
+            Out += std::format("Triage={}  Verification=Unverified  Suppression={}  RunPresence=Observed\n", A.m_bAcknowledged ? "Acknowledged" : "Unreviewed", A.m_bMuted ? "Muted" : "None");
             const auto Retained = P->m_First.size() + P->m_Last.size();
             Out += std::format("Evidence={}  Observed={}  Retained={}\n", Retained < P->m_Count ? "summarized" : "full", P->m_Count, Retained);
             for (auto Seq : P->m_First) Out += std::format("Occurrence={}\n", Seq);
@@ -420,6 +412,122 @@ namespace xlog::commands
     };
 
     //==================================================================================================================
+    // What the Logs window is showing (its query, page and preset): a script that opened it for a person can read where it left them, and the
+    // smoke tests can check what "Open in Logs" did. The window's state belongs to the host; it comes in as a getter.
+    struct window_cmd : log_query
+    {
+        std::function<view_state*()> m_Get;
+        window_cmd(xundo::system& System, std::function<view_state*()> Get) noexcept : log_query(System, "LogWindow"), m_Get(std::move(Get)) {}
+        const char* getCommandHelp() const noexcept override { return "What the Logs window shows: Page (Problems|Events), Query, State (New|Active|All), ShowMuted, Selected. Usage: LogWindow"; }
+        void RegisterArguments() noexcept override {}
+        std::string Query() noexcept override
+        {
+            const view_state* pView = m_Get ? m_Get() : nullptr;
+            if (!pView) return "LogWindow: no window";
+            return std::format("LogWindow: ok\nPage={}  State={}  ShowMuted={}  Follow={}\nSelected={}  SelectedEvent={}\nBack={}\nBackDepth={}  ForwardDepth={}  BackAt={:.0f},{:.0f}  ForwardAt={:.0f},{:.0f}  MouseAt={:.0f},{:.0f}\nEventsOpen={}  SelectedRange={}..{}  EventArrowAt={:.0f},{:.0f}  EventRowAt={:.0f},{:.0f}  EventStride={:.0f}\nQuery={}\n"
+                , (pView->m_RequestPage >= 0 ? pView->m_RequestPage : pView->m_Page) == 0 ? "Problems" : "Events", ProblemViewName(pView->m_View)       // where it is, or where it is about to be
+                , pView->m_bShowMuted, pView->m_bFollow, pView->m_Selected ? Hex16(pView->m_Selected) : std::string("none"), pView->m_SelectedEvent
+                , pView->m_Back.empty() ? std::string("none") : pView->m_Back.back().m_Label, pView->m_Back.size(), pView->m_Forward.size()
+                , pView->m_BackButton[0], pView->m_BackButton[1], pView->m_ForwardButton[0], pView->m_ForwardButton[1], pView->m_MouseAt[0], pView->m_MouseAt[1]
+                , pView->m_ExpandedEvents.size(), pView->m_SelFrom, pView->m_SelTo, pView->m_EventArrowAt[0], pView->m_EventArrowAt[1], pView->m_EventRowAt[0], pView->m_EventRowAt[1], pView->m_EventStride, pView->m_Query);       // the buttons' centres (-1 = not drawn): a test clicks there
+        }
+    };
+
+    // The text the window's Copy puts on the clipboard for the events of a range of sequences (LogEvents gives the sequences): the same function, so a script sees what a person pastes.
+    struct copy_cmd : log_query
+    {
+        copy_cmd(xundo::system& System) noexcept : log_query(System, "LogCopy") { RegisterArguments(); }
+        const char* getCommandHelp() const noexcept override { return "The events of a range of sequences as the plain text the window's Copy puts on the clipboard. Usage: LogCopy -From seq [-To seq]"; }
+        void RegisterArguments() noexcept override
+        {
+            m_hFrom = m_Parser.addOption("From", "First sequence", true, 1);
+            m_hTo = m_Parser.addOption("To", "Last sequence, default From", false, 1);
+        }
+        std::string Query() noexcept override
+        {
+            auto* pHub = Hub();
+            if (!pHub) return "LogCopy: no host";
+            Settle(*pHub);
+            std::string Text; std::uint64_t From = 0, To = 0;
+            if (!Arg(m_hFrom, Text) || !ParseNumber(Text, From)) return "LogCopy: -From is not a sequence";
+            To = From;
+            if (Arg(m_hTo, Text) && !ParseNumber(Text, To)) return "LogCopy: -To is not a sequence";
+            std::vector<std::uint64_t> Seqs;
+            pHub->ForEachEvent(From > 0 ? From - 1 : 0, To, [&](const event& E) { Seqs.push_back(E.m_Key.m_Sequence); return Seqs.size() < 2000; });
+            std::string Out = FormatEventsForCopy(*pHub, Seqs);
+            if (Out.size() > reply_cap_v) Out.resize(reply_cap_v);
+            return "LogCopy: ok\n" + Out;
+        }
+        xcmdline::parser::handle m_hFrom, m_hTo;
+    };
+
+    // What the right-click menu of the Events list does, on the selected events: Copy (the text, as the clipboard gets it), Open and Close (every selected event in place).
+    struct events_action_cmd : log_query
+    {
+        std::function<view_state*()> m_Get;
+        events_action_cmd(xundo::system& System, std::function<view_state*()> Get) noexcept : log_query(System, "LogEventsAction"), m_Get(std::move(Get)) { RegisterArguments(); }
+        const char* getCommandHelp() const noexcept override { return "The Events list's right-click menu on the selected events: copy (replies with the text the clipboard gets), open or close (every selected event in place). Usage: LogEventsAction -Action copy|open|close"; }
+        void RegisterArguments() noexcept override { m_hAction = m_Parser.addOption("Action", "copy, open or close", true, 1); }
+        std::string Query() noexcept override
+        {
+            view_state* pView = m_Get ? m_Get() : nullptr;
+            auto* pHub = Hub();
+            if (!pView || !pHub) return "LogEventsAction: no window";
+            Settle(*pHub);
+            std::string Action;
+            Arg(m_hAction, Action);
+            const auto Selected = pView->SelectedEvents();
+            if (Action == "open" || Action == "close") { pView->SetSelectedEventsOpen(Action == "open"); return std::format("LogEventsAction: {} {} event(s)", Action, Selected.size()); }
+            if (Action == "copy")
+            {
+                std::string Out = FormatEventsForCopy(*pHub, Selected);
+                if (Out.size() > reply_cap_v) Out.resize(reply_cap_v);
+                return std::format("LogEventsAction: copied {} event(s)\n", Selected.size()) + Out;
+            }
+            return "LogEventsAction: -Action must be copy, open or close";
+        }
+        xcmdline::parser::handle m_hAction;
+    };
+
+    // The Back and Forward buttons as commands: the window (and what the host had in front) returns to where it was, or goes ahead again.
+    struct back_cmd : log_query
+    {
+        std::function<bool()> m_Go;
+        bool                  m_bForward;
+        back_cmd(xundo::system& System, std::function<bool()> Go, bool bForward) noexcept : log_query(System, bForward ? "LogForward" : "LogBack"), m_Go(std::move(Go)), m_bForward(bForward) {}
+        const char* getCommandHelp() const noexcept override
+        {
+            return m_bForward ? "The Logs window's Forward: goes ahead again after a Back. Usage: LogForward"
+                              : "The Logs window's Back: returns to the view it was in before something (an editor's Feedback, Show in Events) moved it. Usage: LogBack";
+        }
+        void RegisterArguments() noexcept override {}
+        std::string Query() noexcept override
+        {
+            if (m_Go && m_Go()) return m_bForward ? "LogForward: forward" : "LogBack: back";
+            return m_bForward ? "LogForward: there is nothing to go forward to" : "LogBack: there is nothing to go back to";
+        }
+    };
+
+    // Opens the Logs for the person: the drawer on the Logs tab with a query in the bar (what an editor's Feedback does). Back returns them to what they had.
+    struct show_cmd : log_query
+    {
+        std::function<void(const std::string&)> m_Show;
+        show_cmd(xundo::system& System, std::function<void(const std::string&)> Show) noexcept : log_query(System, "LogShow"), m_Show(std::move(Show)) { RegisterArguments(); }
+        const char* getCommandHelp() const noexcept override { return "Opens the Logs window on a query, as an editor's Feedback does (Back returns to what was in front). Usage: LogShow [-Query q]"; }
+        void RegisterArguments() noexcept override { m_hQuery = m_Parser.addOption("Query", "The query bar's text, e.g. op:4", false, 1); }
+        std::string Query() noexcept override
+        {
+            std::string Text;
+            Arg(m_hQuery, Text);
+            if (const filter F = ParseQuery(Text); !F.m_Error.empty()) return std::format("LogShow: invalid query: {}", F.m_Error);
+            if (!m_Show) return "LogShow: no window";
+            m_Show(Text);
+            return "LogShow: shown";
+        }
+        xcmdline::parser::handle m_hQuery;
+    };
+
+    //==================================================================================================================
     // Diagnostic producers for the smoke tests (and for a script that wants to leave a note): they go through the real ring, adapters and store.
     //==================================================================================================================
     struct simulate_build_cmd : log_query
@@ -463,6 +571,42 @@ namespace xlog::commands
         xcmdline::parser::handle m_hText, m_hExit, m_hSubject;
     };
 
+    struct simulate_compile_cmd : log_query
+    {
+        simulate_compile_cmd(xundo::system& System) noexcept : log_query(System, "LogSimulateCompile") { RegisterArguments(); }
+        const char* getCommandHelp() const noexcept override { return "Diagnostic: runs a resource compiler's output through the pipeline adapter as an asset.compile operation about one asset. Usage: LogSimulateCompile -Text base64 -Asset id [-Exit n] [-Name n] [-Type texture]"; }
+        void RegisterArguments() noexcept override
+        {
+            m_hText = m_Parser.addOption("Text", "The compiler's output, base64", true, 1);
+            m_hAsset = m_Parser.addOption("Asset", "The asset's instance id (any number): the operation's subject", true, 1);
+            m_hExit = m_Parser.addOption("Exit", "0 (default) = succeeded, otherwise failed", false, 1);
+            m_hName = m_Parser.addOption("Name", "The asset's name", false, 1);
+            m_hType = m_Parser.addOption("Type", "The resource type, default texture", false, 1);
+        }
+        std::string Query() noexcept override
+        {
+            auto* pHub = Hub();
+            if (!pHub) return "LogSimulateCompile: no host";
+            std::string Text, AssetText, ExitText, Name = "simulated asset", Type = "texture";
+            if (!Arg(m_hText, Text) || !Arg(m_hAsset, AssetText)) return "LogSimulateCompile: -Text and -Asset are required";
+            std::uint64_t Asset = 0, Exit = 0;
+            if (!ParseNumber(AssetText, Asset)) return "LogSimulateCompile: -Asset is not a number";
+            if (Arg(m_hExit, ExitText) && !ParseNumber(ExitText, Exit)) return "LogSimulateCompile: -Exit is not a number";
+            Arg(m_hName, Name); Arg(m_hType, Type);
+
+            ref Subject; Subject.m_Type = ref::type::Asset; Subject.m_Id = Asset; Subject.m_Path = Name;
+            auto Op = pHub->Begin("asset.compile", { origin::type::System, "asset pipeline", 0 }, Subject, std::format("Compile {}", Name));
+            const auto Id = Op.Id();
+            {
+                pipeline_output_adapter Adapter(*pHub, Op, Subject, "asset.compile." + Type);
+                FeedPipelineOutput(Adapter, Base64Decode(Text));
+            }
+            Exit == 0 ? Op.Succeed() : Op.Fail();
+            return std::format("LogSimulateCompile: operation {}", Id);
+        }
+        xcmdline::parser::handle m_hText, m_hAsset, m_hExit, m_hName, m_hType;
+    };
+
     struct emit_cmd : log_query
     {
         emit_cmd(xundo::system& System) noexcept : log_query(System, "LogEmit") { RegisterArguments(); }
@@ -500,13 +644,96 @@ namespace xlog::commands
         xcmdline::parser::handle m_hText, m_hSeverity, m_hChannel, m_hCode, m_hKind, m_hCount;
     };
 
+    //==================================================================================================================
+    // The person's decisions about problems. They are edits like any other: undoable, in the workspace's history. (LogVerify, in P2, will not be:
+    // a verification is a fact the evidence supports, not a choice.)
+    struct annotate_cmd : xundo::command_base
+    {
+        enum class what : std::uint8_t { Acknowledge, Mute };
+        what m_What;
+        annotate_cmd(xundo::system& System, const char* pName, what What) noexcept : xundo::command_base(System, pName, nullptr), m_What(What) { RegisterArguments(); }
+        const char* getCommandHelp() const noexcept override
+        {
+            return m_What == what::Acknowledge ? "Marks a problem as seen (undoable); it stays listed and keeps counting. Usage: LogAcknowledge -Id hex16 [-Value true|false]"
+                                               : "Hides a problem from the lists (undoable): collection continues, the footer counts what is hidden, a Fatal one cannot be hidden. Usage: LogMute -Id hex16 [-Value true|false]";
+        }
+        void RegisterArguments() noexcept override
+        {
+            m_hId = m_Parser.addOption("Id", "The problem id (16 hex digits) as LogProblems prints it", true, 1);
+            m_hValue = m_Parser.addOption("Value", "true (default) or false: undo it by hand", false, 1);
+        }
+        bool Arg(xcmdline::parser::handle Handle, std::string& Out) noexcept
+        {
+            auto A = m_Parser.getOptionArgAs<std::string>(Handle, 0);
+            if (std::holds_alternative<xerr>(A)) return false;
+            Out = std::get<std::string>(A);
+            return true;
+        }
+        std::uint64_t ProblemId() noexcept { std::string Text; return Arg(m_hId, Text) ? std::strtoull(Text.c_str(), nullptr, 16) : 0; }
+        bool Flag(const annotation& A) const noexcept { return m_What == what::Acknowledge ? A.m_bAcknowledged : A.m_bMuted; }
+        void Set(hub& H, std::uint64_t Id, bool b) const noexcept { if (m_What == what::Acknowledge) H.SetAcknowledged(Id, b); else H.SetMuted(Id, b); }
+
+        std::string Redo() noexcept override
+        {
+            auto* pHub = hub::current();
+            if (!pHub) return std::format("{}: no host", m_pCommandName);
+            for (int i = 0; i < 64 && pHub->Drain(1u << 16) > 0; ++i) {}
+            const auto Id = ProblemId();
+            if (!pHub->FindProblem(Id)) return std::format("{}: no problem {}", m_pCommandName, Hex16(Id));
+            std::string Text;
+            const bool bValue = !(Arg(m_hValue, Text) && Text == "false");
+            if (bValue && m_What == what::Mute && pHub->FindProblem(Id)->m_Severity >= severity::Fatal) return std::format("{}: a Fatal problem cannot be hidden", m_pCommandName);
+            Set(*pHub, Id, bValue);
+            return {};
+        }
+        void BackupCurrenState(xundo::undo_file& File) noexcept override
+        {
+            const std::uint64_t Id = ProblemId();
+            std::uint8_t Before = 0;
+            if (auto* pHub = hub::current()) Before = Flag(pHub->Annotation(Id)) ? 1 : 0;
+            File.Write(Id);
+            File.Write(Before);
+        }
+        void Undo(xundo::undo_file& File) noexcept override
+        {
+            std::uint64_t Id = 0; std::uint8_t Before = 0;
+            File.Read(Id); File.Read(Before);
+            if (auto* pHub = hub::current()) Set(*pHub, Id, Before != 0);
+        }
+        xcmdline::parser::handle m_hId, m_hValue;
+    };
+
+    // "Everything up to now has been seen": moves the baseline the New preset counts from.
+    struct mark_cmd : xundo::command_base
+    {
+        mark_cmd(xundo::system& System) noexcept : xundo::command_base(System, "LogMark", nullptr) { RegisterArguments(); }
+        const char* getCommandHelp() const noexcept override { return "Moves the baseline: problems first seen before now are no longer New (undoable). Usage: LogMark [-Kind baseline]"; }
+        void RegisterArguments() noexcept override { m_hKind = m_Parser.addOption("Kind", "baseline (the only kind so far)", false, 1); }
+        std::string Redo() noexcept override
+        {
+            auto* pHub = hub::current();
+            if (!pHub) return "LogMark: no host";
+            auto A = m_Parser.getOptionArgAs<std::string>(m_hKind, 0);
+            if (!std::holds_alternative<xerr>(A) && std::get<std::string>(A) != "baseline") return "LogMark: -Kind must be baseline";
+            for (int i = 0; i < 64 && pHub->Drain(1u << 16) > 0; ++i) {}
+            pHub->SetBaseline(pHub->Committed());
+            return {};
+        }
+        void BackupCurrenState(xundo::undo_file& File) noexcept override { File.Write(hub::current() ? hub::current()->Baseline() : std::uint64_t{ 0 }); }
+        void Undo(xundo::undo_file& File) noexcept override { std::uint64_t Before = 0; File.Read(Before); if (auto* pHub = hub::current()) pHub->SetBaseline(Before); }
+        xcmdline::parser::handle m_hKind;
+    };
+
     // All the commands of the Logs, owned together: add one of these to whatever owns the workspace's undo system.
     struct command_set
     {
-        explicit command_set(xundo::system& System) noexcept
-            : m_Status(System), m_Operations(System), m_Problems(System), m_Problem(System), m_Events(System), m_Event(System), m_SimulateBuild(System), m_Emit(System) {}
+        explicit command_set(xundo::system& System, std::function<view_state*()> Window = {}, std::function<bool()> Back = {}, std::function<bool()> Forward = {}
+            , std::function<void(const std::string&)> Show = {}) noexcept
+            : m_Status(System), m_Operations(System), m_Problems(System), m_Problem(System), m_Events(System), m_Event(System), m_SimulateBuild(System), m_SimulateCompile(System), m_Emit(System)
+            , m_Acknowledge(System, "LogAcknowledge", annotate_cmd::what::Acknowledge), m_Mute(System, "LogMute", annotate_cmd::what::Mute), m_Mark(System), m_Window(System, Window), m_BackCmd(System, std::move(Back), false), m_ForwardCmd(System, std::move(Forward), true), m_Show(System, std::move(Show)), m_Copy(System), m_EventsAction(System, std::move(Window)) {}
         status_cmd m_Status; operations_cmd m_Operations; problems_cmd m_Problems; problem_cmd m_Problem; events_cmd m_Events; event_cmd m_Event;
-        simulate_build_cmd m_SimulateBuild; emit_cmd m_Emit;
+        simulate_build_cmd m_SimulateBuild; simulate_compile_cmd m_SimulateCompile; emit_cmd m_Emit;
+        annotate_cmd m_Acknowledge, m_Mute; mark_cmd m_Mark; window_cmd m_Window; back_cmd m_BackCmd, m_ForwardCmd; show_cmd m_Show; copy_cmd m_Copy; events_action_cmd m_EventsAction;
     };
 }
 

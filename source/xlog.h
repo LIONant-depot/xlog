@@ -8,7 +8,7 @@
 //   xlog_hub.h       the record types, the hub (ring, store, problems, operations), the query grammar        no dependencies beyond the standard library
 //   xlog_build.h     the MSBuild / cl / link / CMake output adapter                                         <regex>
 //   xlog_commands.h  the pipe commands (LogStatus, LogProblems, LogEvents, ...)                             xundo, xcmdline
-//   xlog_tab.h       the Log tab, to embed in any editor                                                  ImGui
+//   (the window and the diagnostics view are the editor part: editor/xlog_tab.h, editor/xlog_diagnostics.h; not here)
 #include "xlog_hub.h"
 
 #endif // XLOG_H

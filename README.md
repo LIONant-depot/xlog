@@ -21,4 +21,9 @@ Op.Fail();                                                 // an operation dropp
 
 The host thread calls `hub.Drain()` once per frame (or per loop iteration in a headless host); queries drain first, so a query sees everything pushed before it.
 
+## Two parts
+
+- **`source/`: the runtime.** The hub, the store, the query grammar, the view state and its list builders, the build and pipeline adapters, the pipe commands. Standard library, xundo and xcmdline only: **no ImGui, no editor**, so a headless host, a compiler process or a test harness uses exactly the same service.
+- **`editor/`: the editor part.** `xlog_tab.h` (the Logs window: Problems | Events) and `xlog_diagnostics.h` (what an asset's last compile said, for the resource editors' Feedback). They need ImGui and xeditor's `widgets.h` (the editors' one search box); a build without an editor never includes them.
+
 Design, phases and acceptance tests: `documentation/Editors/DESIGN_logs.md` in xLION.
