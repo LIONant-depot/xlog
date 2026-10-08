@@ -280,6 +280,8 @@ namespace xlog::remote
             else if (auto* pX = std::get_if<op_end>(&D.m_Record)) { if (auto It = Operations.find(pX->m_Id); It != Operations.end()) { It->second.End(pX->m_Outcome); Operations.erase(It); } }
         }
 
+#endif
+        // Linux port: members live outside the Win32 block so the accessors compile everywhere
         std::string                 m_Pipe;
         hub*                        m_pHub = nullptr;
         std::atomic<bool>           m_bStop{ false };
@@ -287,9 +289,12 @@ namespace xlog::remote
         std::thread                 m_Accept;
         mutable std::mutex          m_Mutex;
         std::vector<std::thread>    m_Workers;
+#if defined(_WIN32)
         std::vector<HANDLE>         m_Open;
-        std::atomic<std::uint64_t>  m_Connections{ 0 }, m_Records{ 0 }, m_Rejected{ 0 };
+#else
+        std::vector<void*>          m_Open;     // no remote log server on Linux yet
 #endif
+        std::atomic<std::uint64_t>  m_Connections{ 0 }, m_Records{ 0 }, m_Rejected{ 0 };
     };
 }
 

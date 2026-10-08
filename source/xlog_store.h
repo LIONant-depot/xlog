@@ -775,7 +775,7 @@ namespace xlog::store
         std::ifstream In(Path, std::ios::binary);
         for (std::string Line; std::getline(In, Line);)
         {
-            if (!Line.empty() && Line.back() == '') Line.pop_back();
+            if (!Line.empty() && Line.back() == '\r') Line.pop_back();
             if (Line.empty() || Line[0] == '#') continue;
             std::vector<std::string> F;
             for (auto& Raw : Split(Line, '	')) F.push_back(Unescape(Raw));
