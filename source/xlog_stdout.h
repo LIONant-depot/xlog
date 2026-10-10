@@ -5,7 +5,7 @@
 // The stdout tap (documentation/Editors/DESIGN_logs.md, 9.2): what code that predates the Logs prints with printf and fprintf(stderr) becomes events, so it is in the same list as everything
 // else. It is the legacy-grade path and is labelled so: a line carries no code and no subject, its severity is a guess (stderr is a warning, a line that says error/fatal/assert is an
 // error), and the problem it forms is identified by the line's template (digits and paths do not make a new problem). Opt-in (LogStdout -On true), because it replaces the process'
-// stdout and stderr with pipes. Everything read is written on to the original stdout and stderr, so the console, a redirect to a file and the smoke tests' log still see every byte.
+// stdout and stderr with pipes (the CRT calls on Windows, the POSIX ones elsewhere). Everything read is written on to the original stdout and stderr, so the console, a redirect to a file and the smoke tests' log still see every byte.
 // Headless-safe: no ImGui, no editor.
 
 #include "xlog_hub.h"
@@ -18,10 +18,31 @@
 #if defined(_WIN32)
     #include <fcntl.h>
     #include <io.h>
+#else
+    #include <unistd.h>
 #endif
 
 namespace xlog
 {
+    namespace details
+    {
+#if defined(_WIN32)
+        inline int  FdDup  (int Fd)                          noexcept { return _dup(Fd); }
+        inline int  FdDup2 (int From, int To)                noexcept { return _dup2(From, To) == 0 ? To : -1; }
+        inline int  FdPipe (int Fds[2])                      noexcept { return _pipe(Fds, 1 << 16, _O_BINARY); }
+        inline int  FdClose(int Fd)                          noexcept { return _close(Fd); }
+        inline int  FdRead (int Fd, void* p, unsigned n)     noexcept { return _read(Fd, p, n); }
+        inline void FdWrite(int Fd, const void* p, unsigned n) noexcept { _write(Fd, p, n); }
+#else
+        inline int  FdDup  (int Fd)                          noexcept { return dup(Fd); }
+        inline int  FdDup2 (int From, int To)                noexcept { return dup2(From, To) == To ? To : -1; }
+        inline int  FdPipe (int Fds[2])                      noexcept { return pipe(Fds); }
+        inline int  FdClose(int Fd)                          noexcept { return close(Fd); }
+        inline int  FdRead (int Fd, void* p, unsigned n)     noexcept { return static_cast<int>(read(Fd, p, n)); }
+        inline void FdWrite(int Fd, const void* p, unsigned n) noexcept { for (unsigned Done = 0; Done < n; ) { const auto W = write(Fd, static_cast<const char*>(p) + Done, n - Done); if (W <= 0) break; Done += static_cast<unsigned>(W); } }
+#endif
+    }
+
     class stdout_tap
     {
     public:
@@ -37,50 +58,42 @@ namespace xlog
         bool Start(hub& Hub, std::string& Why) noexcept
         {
             if (m_bRunning) return true;
-#if defined(_WIN32)
             std::fflush(stdout); std::fflush(stderr);
             for (int i = 0; i < 2; ++i)
             {
-                m_Saved[i] = _dup(i + 1);
+                m_Saved[i] = details::FdDup(i + 1);
                 int Fds[2] = { -1, -1 };
-                if (m_Saved[i] < 0 || _pipe(Fds, 1 << 16, _O_BINARY) != 0) { Why = "the process' streams cannot be duplicated"; Undo(i); return false; }
+                if (m_Saved[i] < 0 || details::FdPipe(Fds) != 0) { Why = "the process' streams cannot be duplicated"; Undo(i); return false; }
                 m_Read[i] = Fds[0]; m_Write[i] = Fds[1];
-                if (_dup2(Fds[1], i + 1) != 0) { Why = "the process' streams cannot be replaced"; Undo(i + 1); return false; }
+                if (details::FdDup2(Fds[1], i + 1) < 0) { Why = "the process' streams cannot be replaced"; Undo(i + 1); return false; }
             }
             setvbuf(stdout, nullptr, _IONBF, 0);                   // a printf reaches the pipe when it is called, not when a buffer fills
             m_pHub = &Hub;
             m_bRunning = true;
             for (int i = 0; i < 2; ++i) m_Thread[i] = std::thread([this, i] { Read(i); });
             return true;
-#else
-            Why = "the stdout tap is only built for Windows";
-            return false;
-#endif
         }
 
         void Stop() noexcept
         {
-#if defined(_WIN32)
             if (!m_bRunning) return;
             std::fflush(stdout); std::fflush(stderr);
-            for (int i = 0; i < 2; ++i) _dup2(m_Saved[i], i + 1);     // the originals are back: the pipes' write ends at 1 and 2 are closed by this
-            for (int i = 0; i < 2; ++i) { _close(m_Write[i]); m_Write[i] = -1; }
+            for (int i = 0; i < 2; ++i) details::FdDup2(m_Saved[i], i + 1);     // the originals are back: the pipes' write ends at 1 and 2 are closed by this
+            for (int i = 0; i < 2; ++i) { details::FdClose(m_Write[i]); m_Write[i] = -1; }
             for (int i = 0; i < 2; ++i) if (m_Thread[i].joinable()) m_Thread[i].join();   // they read the end of the pipe and finish
-            for (int i = 0; i < 2; ++i) { _close(m_Read[i]); _close(m_Saved[i]); m_Read[i] = m_Saved[i] = -1; }
+            for (int i = 0; i < 2; ++i) { details::FdClose(m_Read[i]); details::FdClose(m_Saved[i]); m_Read[i] = m_Saved[i] = -1; }
             m_bRunning = false;
-#endif
         }
 
     private:
-#if defined(_WIN32)
         void Undo(int Count) noexcept        // a failed start puts back what it took
         {
-            for (int i = 0; i < Count && i < 2; ++i) { if (m_Saved[i] >= 0) _dup2(m_Saved[i], i + 1); }
+            for (int i = 0; i < Count && i < 2; ++i) { if (m_Saved[i] >= 0) details::FdDup2(m_Saved[i], i + 1); }
             for (int i = 0; i < 2; ++i)
             {
-                if (m_Write[i] >= 0) _close(m_Write[i]);
-                if (m_Read[i] >= 0)  _close(m_Read[i]);
-                if (m_Saved[i] >= 0) _close(m_Saved[i]);
+                if (m_Write[i] >= 0) details::FdClose(m_Write[i]);
+                if (m_Read[i] >= 0)  details::FdClose(m_Read[i]);
+                if (m_Saved[i] >= 0) details::FdClose(m_Saved[i]);
                 m_Write[i] = m_Read[i] = m_Saved[i] = -1;
             }
         }
@@ -99,9 +112,9 @@ namespace xlog
             char Buffer[4096];
             for (;;)
             {
-                const int N = _read(m_Read[Stream], Buffer, sizeof(Buffer));
+                const int N = details::FdRead(m_Read[Stream], Buffer, sizeof(Buffer));
                 if (N <= 0) break;
-                _write(m_Saved[Stream], Buffer, static_cast<unsigned>(N));                           // on to where it was going
+                details::FdWrite(m_Saved[Stream], Buffer, static_cast<unsigned>(N));                           // on to where it was going
                 for (int i = 0; i < N; ++i)
                 {
                     if (Buffer[i] == '\n') { Emit(Stream, Line); Line.clear(); }
@@ -126,7 +139,6 @@ namespace xlog
         }
 
         int                  m_Saved[2] = { -1, -1 }, m_Read[2] = { -1, -1 }, m_Write[2] = { -1, -1 };
-#endif
         std::thread          m_Thread[2];
         hub*                 m_pHub = nullptr;
         bool                 m_bRunning = false;
