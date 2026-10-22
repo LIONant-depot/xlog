@@ -116,6 +116,8 @@ namespace xlog::remote
         Header.m_Session = Hub.Session(); Header.m_StartWallMs = WallMs(); Header.m_Exe = std::move(Exe);
 #if defined(_WIN32)
         Header.m_Pid = static_cast<std::uint32_t>(GetCurrentProcessId());
+#else
+        Header.m_Pid = static_cast<std::uint32_t>(::getpid());
 #endif
         auto pClient = std::make_shared<client_sink>(std::move(Pipe), Header);
         Hub.AttachSink(Hub.Sink() ? std::static_pointer_cast<record_sink>(std::make_shared<tee_sink>(Hub.Sink(), pClient)) : std::static_pointer_cast<record_sink>(pClient));

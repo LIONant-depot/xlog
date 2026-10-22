@@ -27,6 +27,8 @@
 #include <unordered_set>
 #if defined(_WIN32)
     #include <process.h>
+#else
+    #include <unistd.h>
 #endif
 
 namespace xlog::store
@@ -852,6 +854,8 @@ namespace xlog::store
         Header.m_Session = Hub.Session(); Header.m_StartWallMs = Hub.StartWallMs(); Header.m_Exe = std::move(Exe);
 #if defined(_WIN32)
         Header.m_Pid = static_cast<std::uint32_t>(_getpid());
+#else
+        Header.m_Pid = static_cast<std::uint32_t>(::getpid());                   // 0 on every launch would give one launch the crash record of another
 #endif
         const std::filesystem::path Logs = Options.m_Logs;
         auto pSink = std::make_shared<persistence>(Header, std::move(Options));
